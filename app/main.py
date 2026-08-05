@@ -112,7 +112,7 @@ def validate_model(model_name: Optional[str]) -> None:
 # ---------------------------------------------------------------------------
 
 app = FastAPI(
-    title="Classroom OpenAI Proxy",
+    title="PGL OpenAI Proxy",
     description=(
         "OpenAI-compatible proxy that restricts which models students can "
         "use, forwards requests to OpenAI using a key that is never exposed "

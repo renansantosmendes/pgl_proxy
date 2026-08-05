@@ -1,4 +1,4 @@
-# Classroom OpenAI Proxy
+# PGL OpenAI Proxy
 
 A lightweight FastAPI reverse proxy that sits between students' LangChain
 clients and the OpenAI API, so the real OpenAI API key is never exposed to

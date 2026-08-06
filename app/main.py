@@ -17,7 +17,9 @@ How it works
 3. The real key lives only on this server and is never sent to, or seen by,
    student code.
 4. Every call is automatically traced in Langfuse: prompts, completions,
-   token usage, latency, and errors.
+   token usage, latency, and errors. Each trace is tagged with the
+   student's matricula (as `langfuse_user_id`), so usage in the Langfuse
+   dashboard can be filtered/grouped per student.
 
 Authentication
 --------------
@@ -221,15 +223,19 @@ async def chat_completions(
 
     if is_streaming:
         return StreamingResponse(
-            _stream_chat_completion(payload),
+            _stream_chat_completion(payload, matricula),
             media_type="text/event-stream",
         )
 
-    completion = await openai_client.chat.completions.create(**payload)
+    completion = await openai_client.chat.completions.create(
+        **payload,
+        langfuse_user_id=matricula,
+        langfuse_metadata={"matricula": matricula},
+    )
     return JSONResponse(content=completion.model_dump())
 
 
-async def _stream_chat_completion(payload: dict):
+async def _stream_chat_completion(payload: dict, matricula: str):
     """Relay a streaming chat completion from OpenAI chunk by chunk.
 
     Parameters
@@ -237,6 +243,9 @@ async def _stream_chat_completion(payload: dict):
     payload:
         The JSON body of the original student request, forwarded as-is
         (with ``stream`` already set to ``true``) to the OpenAI SDK.
+    matricula:
+        The requesting student's matricula, attached to the Langfuse trace
+        so usage can be attributed to them.
 
     Yields
     ------
@@ -245,7 +254,11 @@ async def _stream_chat_completion(payload: dict):
         OpenAI's own streaming API produces, so the student's client can
         parse it the way it expects.
     """
-    stream = await openai_client.chat.completions.create(**payload)
+    stream = await openai_client.chat.completions.create(
+        **payload,
+        langfuse_user_id=matricula,
+        langfuse_metadata={"matricula": matricula},
+    )
     async for chunk in stream:
         yield f"data: {chunk.model_dump_json()}\n\n".encode("utf-8")
     yield b"data: [DONE]\n\n"

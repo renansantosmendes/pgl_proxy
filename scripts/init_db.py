@@ -1,9 +1,12 @@
 """
 init_db.py
 
-Creates the `pgl_proxy` schema and the `students` table in Neon
-(idempotent — safe to run multiple times). Run this once before starting
-the proxy for the first time, and again any time db/schema.sql changes.
+Creates the `pgl_proxy` schema and the `students` table in Neon. Run this
+once before starting the proxy for the first time.
+
+WARNING: db/schema.sql drops and recreates the `students` table, so
+re-running this script wipes any rows already registered. Re-register
+matriculas with scripts/manage_students.py afterwards.
 
 Usage
 -----

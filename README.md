@@ -19,7 +19,9 @@ monitoring (cost, latency, prompts, completions, errors).
 3. The real OpenAI key lives only on the server and is never sent to, or
    seen by, student code.
 4. Every call is automatically traced in Langfuse: prompts, completions,
-   token usage, latency, and errors.
+   token usage, latency, and errors — each trace tagged with the student's
+   matricula (`langfuse_user_id`), so you can filter/group usage per
+   student in the Langfuse dashboard.
 
 ## Project structure
 
@@ -84,14 +86,20 @@ Only matriculas registered and marked active in Neon may use the proxy.
    python -m scripts.init_db
    ```
 
-   This creates the `pgl_proxy.students` table:
+   This creates the `pgl_proxy.students` table (dropping it first if it
+   already exists, so re-running this wipes existing rows):
 
-   | column          | type          | notes                              |
-   |-----------------|---------------|-------------------------------------|
-   | `matricula`     | `text`        | primary key, the enrollment number |
-   | `id`            | `uuid`        | auto-generated surrogate id        |
-   | `is_active`     | `boolean`     | defaults to `true`                 |
-   | `last_modified` | `timestamptz` | auto-updated by a trigger on `UPDATE` |
+   | column          | type          | notes                                  |
+   |-----------------|---------------|------------------------------------------|
+   | `matricula`     | `text`        | primary key, the enrollment number     |
+   | `id`            | `uuid`        | auto-generated surrogate id            |
+   | `full_name`     | `text`        | from Canvas "Nome"                     |
+   | `login_id`      | `text`        | from Canvas "ID de Login"               |
+   | `sis_id`        | `text`        | from Canvas "ID do SIS"                 |
+   | `course`        | `text`        | from Canvas "Seção"                     |
+   | `role`          | `text`        | from Canvas "Papel"                     |
+   | `is_active`     | `boolean`     | defaults to `true`                     |
+   | `last_modified` | `timestamptz` | auto-updated by a trigger on `UPDATE`  |
 
 2. **Manage matriculas** with the companion CLI:
 
@@ -100,6 +108,15 @@ Only matriculas registered and marked active in Neon may use the proxy.
    python -m scripts.manage_students deactivate 20231001
    python -m scripts.manage_students activate 20231001
    python -m scripts.manage_students list
+   ```
+
+   For a full roster export from Canvas ("People" page → export as CSV,
+   or transcribed into [`db/roster.csv`](db/roster.csv) with columns
+   `matricula,full_name,login_id,sis_id,course,role`), bulk-import it
+   instead — this upserts by matricula and marks every imported row active:
+
+   ```bash
+   python -m scripts.import_students_csv db/roster.csv
    ```
 
 3. Students set their matricula as `api_key` when configuring their client,

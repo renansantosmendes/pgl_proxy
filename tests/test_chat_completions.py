@@ -3,6 +3,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from conftest import ACTIVE_MATRICULA
+
 
 def make_completion(content: str = "hello from mock"):
     """Build a stand-in for OpenAI's ChatCompletion, matching the
@@ -98,6 +100,8 @@ def test_allowed_model_forwards_to_openai_and_returns_completion(
     mock_openai_create.assert_awaited_once_with(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": "What is the answer?"}],
+        langfuse_user_id=ACTIVE_MATRICULA,
+        langfuse_metadata={"matricula": ACTIVE_MATRICULA},
     )
 
 

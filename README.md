@@ -20,8 +20,8 @@ monitoring (cost, latency, prompts, completions, errors).
    seen by, student code.
 4. Every call is automatically traced in Langfuse: prompts, completions,
    token usage, latency, and errors — each trace tagged with the student's
-   matricula (`langfuse_user_id`), so you can filter/group usage per
-   student in the Langfuse dashboard.
+   matricula as `user_id` (via `langfuse.propagate_attributes`), so you can
+   filter/group usage per student in the Langfuse dashboard.
 
 ## Project structure
 
@@ -85,9 +85,9 @@ guardrails before forwarding a request to OpenAI:
 
 - **Payload allowlist** (`ALLOWED_PAYLOAD_FIELDS`): only known OpenAI chat
   completion fields are forwarded — anything else in the request body is
-  dropped, so a student can't smuggle in unexpected fields (including ones
-  that would collide with the `langfuse_user_id`/`langfuse_metadata` kwargs
-  the proxy adds itself).
+  dropped, so a student can't smuggle in unexpected fields (including a
+  `metadata` field, which would otherwise collide with the one the proxy
+  adds itself for Langfuse).
 - **Cost caps**: `max_tokens`/`max_completion_tokens` above
   `MAX_TOKENS_LIMIT` (2048) or `n` above `MAX_N` (1) are rejected with
   `400`, capping the worst case cost of a single request.

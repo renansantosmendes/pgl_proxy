@@ -100,8 +100,7 @@ def test_allowed_model_forwards_to_openai_and_returns_completion(
     mock_openai_create.assert_awaited_once_with(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": "What is the answer?"}],
-        langfuse_user_id=ACTIVE_MATRICULA,
-        langfuse_metadata={"matricula": ACTIVE_MATRICULA},
+        metadata={"matricula": ACTIVE_MATRICULA},
     )
 
 
@@ -211,7 +210,7 @@ def test_unknown_fields_are_dropped_before_forwarding(
         json={
             "model": "gpt-4o-mini",
             "messages": [{"role": "user", "content": "hi"}],
-            "langfuse_user_id": "someone-else",
+            "metadata": {"matricula": "someone-else"},
             "some_unexpected_field": "should be dropped",
         },
     )
@@ -220,6 +219,5 @@ def test_unknown_fields_are_dropped_before_forwarding(
     mock_openai_create.assert_awaited_once_with(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": "hi"}],
-        langfuse_user_id=ACTIVE_MATRICULA,
-        langfuse_metadata={"matricula": ACTIVE_MATRICULA},
+        metadata={"matricula": ACTIVE_MATRICULA},
     )

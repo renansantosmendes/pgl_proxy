@@ -18,8 +18,9 @@ How it works
    student code.
 4. Every call is automatically traced in Langfuse: prompts, completions,
    token usage, latency, and errors. Each trace is tagged with the
-   student's matricula (as `langfuse_user_id`), so usage in the Langfuse
-   dashboard can be filtered/grouped per student.
+   student's matricula as the trace's `user_id` (via
+   `langfuse.propagate_attributes`), so usage in the Langfuse dashboard can
+   be filtered/grouped per student.
 
 Authentication
 --------------
@@ -52,6 +53,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 # The Langfuse-wrapped OpenAI client is a drop-in replacement for the
 # official `openai` SDK client: every call made through it is automatically
 # traced in Langfuse (prompt, completion, token usage, latency, errors).
+from langfuse import propagate_attributes
 from langfuse.openai import AsyncOpenAI
 
 from app.config import OPENAI_API_KEY
@@ -344,11 +346,11 @@ async def chat_completions(
             media_type="text/event-stream",
         )
 
-    completion = await openai_client.chat.completions.create(
-        **payload,
-        langfuse_user_id=matricula,
-        langfuse_metadata={"matricula": matricula},
-    )
+    with propagate_attributes(user_id=matricula):
+        completion = await openai_client.chat.completions.create(
+            **payload,
+            metadata={"matricula": matricula},
+        )
     return JSONResponse(content=completion.model_dump())
 
 
@@ -371,13 +373,13 @@ async def _stream_chat_completion(payload: dict, matricula: str):
         OpenAI's own streaming API produces, so the student's client can
         parse it the way it expects.
     """
-    stream = await openai_client.chat.completions.create(
-        **payload,
-        langfuse_user_id=matricula,
-        langfuse_metadata={"matricula": matricula},
-    )
-    async for chunk in stream:
-        yield f"data: {chunk.model_dump_json()}\n\n".encode("utf-8")
+    with propagate_attributes(user_id=matricula):
+        stream = await openai_client.chat.completions.create(
+            **payload,
+            metadata={"matricula": matricula},
+        )
+        async for chunk in stream:
+            yield f"data: {chunk.model_dump_json()}\n\n".encode("utf-8")
     yield b"data: [DONE]\n\n"
 
 

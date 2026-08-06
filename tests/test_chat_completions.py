@@ -45,14 +45,32 @@ def make_chunk(content: str):
     return SimpleNamespace(model_dump_json=lambda: json.dumps(payload))
 
 
-def test_missing_model_returns_400(client):
-    response = client.post("/v1/chat/completions", json={"messages": []})
+def test_missing_authorization_returns_401(client):
+    response = client.post(
+        "/v1/chat/completions", json={"model": "gpt-4o-mini", "messages": []}
+    )
+
+    assert response.status_code == 401
+
+
+def test_inactive_or_unknown_matricula_returns_403(client, mock_is_enrollment_active):
+    client.headers["Authorization"] = "Bearer 00000000"
+
+    response = client.post(
+        "/v1/chat/completions", json={"model": "gpt-4o-mini", "messages": []}
+    )
+
+    assert response.status_code == 403
+
+
+def test_missing_model_returns_400(authenticated_client):
+    response = authenticated_client.post("/v1/chat/completions", json={"messages": []})
 
     assert response.status_code == 400
 
 
-def test_disallowed_model_returns_403(client):
-    response = client.post(
+def test_disallowed_model_returns_403(authenticated_client):
+    response = authenticated_client.post(
         "/v1/chat/completions",
         json={"model": "gpt-4", "messages": []},
     )
@@ -61,11 +79,11 @@ def test_disallowed_model_returns_403(client):
 
 
 def test_allowed_model_forwards_to_openai_and_returns_completion(
-    client, mock_openai_create
+    authenticated_client, mock_openai_create
 ):
     mock_openai_create.return_value = make_completion("42")
 
-    response = client.post(
+    response = authenticated_client.post(
         "/v1/chat/completions",
         json={
             "model": "gpt-4o-mini",
@@ -83,12 +101,12 @@ def test_allowed_model_forwards_to_openai_and_returns_completion(
     )
 
 
-def test_streaming_request_relays_chunks_as_sse(client, mock_openai_create):
+def test_streaming_request_relays_chunks_as_sse(authenticated_client, mock_openai_create):
     mock_openai_create.return_value = FakeStream(
         [make_chunk("Hel"), make_chunk("lo")]
     )
 
-    response = client.post(
+    response = authenticated_client.post(
         "/v1/chat/completions",
         json={
             "model": "gpt-4o-mini",
@@ -107,11 +125,11 @@ def test_streaming_request_relays_chunks_as_sse(client, mock_openai_create):
     assert '"content": "lo"' in body
 
 
-def test_openai_error_propagates_as_500(client, mock_openai_create):
+def test_openai_error_propagates_as_500(authenticated_client, mock_openai_create):
     mock_openai_create.side_effect = RuntimeError("upstream failure")
 
     with pytest.raises(RuntimeError):
-        client.post(
+        authenticated_client.post(
             "/v1/chat/completions",
             json={
                 "model": "gpt-4o-mini",

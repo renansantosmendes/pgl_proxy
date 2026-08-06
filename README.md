@@ -8,31 +8,35 @@ monitoring (cost, latency, prompts, completions, errors).
 ## How it works
 
 1. Students configure LangChain's `ChatOpenAI` (or the raw OpenAI SDK) to
-   point at this proxy (`base_url="http://your-server:8000/v1"`). The
-   `api_key` field can be any placeholder string, since it is never
-   forwarded to OpenAI.
-2. The server validates the requested model against an allowlist, then uses
-   the **real** OpenAI API key (read from an environment variable) to call
+   point at this proxy (`base_url="http://your-server:8000/v1"`), setting
+   their **matricula** (enrollment number) as the `api_key`. The SDK sends
+   it as an `Authorization: Bearer <matricula>` header.
+2. The server checks that matricula against the `pgl_proxy.students` table
+   in [Neon](https://neon.tech) (must exist and be marked active), then
+   validates the requested model against an allowlist, then uses the
+   **real** OpenAI API key (read from an environment variable) to call
    OpenAI via the Langfuse-instrumented OpenAI SDK client.
-3. The real key lives only on the server and is never sent to, or seen by,
-   student code.
+3. The real OpenAI key lives only on the server and is never sent to, or
+   seen by, student code.
 4. Every call is automatically traced in Langfuse: prompts, completions,
    token usage, latency, and errors.
-
-> **Note:** Per-student authentication (a token per student) was
-> intentionally left out of this version to keep things simple. Without it,
-> anyone who can reach the server can use it. Add authentication (a shared
-> class secret, per-student tokens, or an API gateway) before exposing this
-> publicly.
 
 ## Project structure
 
 ```
 app/
-  main.py           FastAPI application (the proxy itself)
+  main.py             FastAPI application (the proxy itself)
+  db.py                Neon connection pool + matricula lookup
+  config.py            Environment-derived configuration
+db/
+  schema.sql            DDL for the pgl_proxy.students table
+scripts/
+  init_db.py             Creates the schema/table in Neon (run once)
+  manage_students.py      CLI to add/activate/deactivate/list matriculas
 tests/
-  conftest.py        Shared fixtures (test client, mocked OpenAI client)
+  conftest.py        Shared fixtures (test client, mocked OpenAI/Neon calls)
   test_health.py      Tests for GET /health
+  test_auth.py         Tests for the matricula authentication dependency
   test_validate_model.py    Tests for the model allowlist logic
   test_chat_completions.py  Tests for POST /v1/chat/completions
 .github/workflows/
@@ -48,11 +52,14 @@ requirements-dev.txt  Runtime + test dependencies
 
 Mirrors OpenAI's `POST /v1/chat/completions` so LangChain's `ChatOpenAI` (or
 the raw OpenAI SDK) can talk to it without any code changes beyond setting
-`base_url`. Accepts the same JSON body as OpenAI (`model`, `messages`,
-`stream`, etc.).
+`base_url` and `api_key` (the student's matricula). Accepts the same JSON
+body as OpenAI (`model`, `messages`, `stream`, etc.).
 
+- Returns `401` if no matricula was sent (missing/malformed `Authorization`
+  header).
+- Returns `403` if the matricula is not registered or is inactive, or if
+  the requested model is not in the allowlist.
 - Returns `400` if the `model` field is missing.
-- Returns `403` if the requested model is not in the allowlist.
 - Returns the chat completion JSON for regular requests, or relays a
   server-sent events stream when `"stream": true` is set.
 
@@ -66,6 +73,38 @@ The set of models students may request is defined in `ALLOWED_MODELS` in
 [`app/main.py`](app/main.py). Requests for any other model are rejected
 before they reach OpenAI, keeping costs predictable.
 
+## Student authentication (Neon)
+
+Only matriculas registered and marked active in Neon may use the proxy.
+
+1. **Create the schema/table** (once, or whenever
+   [`db/schema.sql`](db/schema.sql) changes):
+
+   ```bash
+   python -m scripts.init_db
+   ```
+
+   This creates the `pgl_proxy.students` table:
+
+   | column          | type          | notes                              |
+   |-----------------|---------------|-------------------------------------|
+   | `matricula`     | `text`        | primary key, the enrollment number |
+   | `id`            | `uuid`        | auto-generated surrogate id        |
+   | `is_active`     | `boolean`     | defaults to `true`                 |
+   | `last_modified` | `timestamptz` | auto-updated by a trigger on `UPDATE` |
+
+2. **Manage matriculas** with the companion CLI:
+
+   ```bash
+   python -m scripts.manage_students add 20231001 20231002
+   python -m scripts.manage_students deactivate 20231001
+   python -m scripts.manage_students activate 20231001
+   python -m scripts.manage_students list
+   ```
+
+3. Students set their matricula as `api_key` when configuring their client,
+   e.g. `ChatOpenAI(base_url="http://your-server:8000/v1", api_key="20231001")`.
+
 ## Running locally
 
 ```bash
@@ -75,7 +114,9 @@ export OPENAI_API_KEY="sk-..."
 export LANGFUSE_PUBLIC_KEY="pk-lf-..."
 export LANGFUSE_SECRET_KEY="sk-lf-..."
 export LANGFUSE_HOST="https://cloud.langfuse.com"  # or your self-hosted URL
+export NEON_DATABASE_URL="postgresql://..."
 
+python -m scripts.init_db  # once, to create the schema/table
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
@@ -92,15 +133,17 @@ pip install -r requirements-dev.txt
 pytest -v
 ```
 
-The test suite mocks the OpenAI client entirely (see
-[`tests/conftest.py`](tests/conftest.py)), so no real API key or network
-access is required to run it. It covers:
+The test suite mocks both the OpenAI client and the Neon lookup entirely
+(see [`tests/conftest.py`](tests/conftest.py)), so no real API key,
+database, or network access is required to run it. It covers:
 
 - The `/health` endpoint.
+- The matricula authentication dependency (`require_active_matricula`):
+  missing/malformed header, inactive/unknown matricula, valid matricula.
 - The model allowlist validation (`validate_model`).
-- `/v1/chat/completions` for missing/disallowed models, successful
-  non-streaming completions, streaming (SSE) completions, and upstream
-  error propagation.
+- `/v1/chat/completions` for missing auth, missing/disallowed models,
+  successful non-streaming completions, streaming (SSE) completions, and
+  upstream error propagation.
 
 ## Continuous integration
 
@@ -120,6 +163,7 @@ before deploying:
 - `LANGFUSE_PUBLIC_KEY`
 - `LANGFUSE_SECRET_KEY`
 - `LANGFUSE_HOST`
+- `NEON_DATABASE_URL`
 
 > **Streaming caveat:** Vercel serverless functions have an execution time
 > limit (10s on the free plan, longer on paid plans). If streamed OpenAI

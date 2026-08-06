@@ -19,27 +19,31 @@ How it works
 4. Every call is automatically traced in Langfuse: prompts, completions,
    token usage, latency, and errors.
 
-Note
-----
-Per-student authentication (token per student) was intentionally removed
-for now to keep this version simple. Without it, anyone who can reach this
-server can use it. Add authentication (e.g. shared class secret, per-student
-tokens, or an API gateway) before exposing this publicly.
+Authentication
+--------------
+Students authenticate with their matricula (enrollment number), passed as
+the `api_key` in their OpenAI/LangChain client (`ChatOpenAI(api_key="...")`).
+The SDK sends it as `Authorization: Bearer <matricula>`, which this server
+checks against the `pgl_proxy.students` table in Neon: the matricula must
+exist and be marked active. See db/schema.sql and scripts/init_db.py to set
+up that table, and scripts/manage_students.py to register matriculas.
 
 Running locally
 ----------------
-    pip install fastapi uvicorn langfuse openai
+    pip install -r requirements.txt
     export OPENAI_API_KEY="sk-..."
     export LANGFUSE_PUBLIC_KEY="pk-lf-..."
     export LANGFUSE_SECRET_KEY="sk-lf-..."
     export LANGFUSE_HOST="https://cloud.langfuse.com"  # or your self-hosted URL
-    uvicorn proxy_openai:app --host 0.0.0.0 --port 8000
+    export NEON_DATABASE_URL="postgresql://..."
+    python -m scripts.init_db  # once, to create the schema/table
+    uvicorn app.main:app --host 0.0.0.0 --port 8000
 """
 
-import os
+from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 
 # The Langfuse-wrapped OpenAI client is a drop-in replacement for the
@@ -47,14 +51,12 @@ from fastapi.responses import StreamingResponse, JSONResponse
 # traced in Langfuse (prompt, completion, token usage, latency, errors).
 from langfuse.openai import AsyncOpenAI
 
+from app.config import OPENAI_API_KEY
+from app.db import close_pool, is_enrollment_active
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-
-#: The real OpenAI API key. This is the only place in the whole system where
-#: it exists, and it must be provided via an environment variable so it
-#: never ends up committed to source control or handed to a student.
-OPENAI_API_KEY: str = os.environ["OPENAI_API_KEY"]
 
 #: Set of model names students are allowed to request. Any request for a
 #: model not in this set is rejected before it ever reaches OpenAI, which
@@ -107,9 +109,65 @@ def validate_model(model_name: Optional[str]) -> None:
         )
 
 
+async def require_active_matricula(
+    authorization: Optional[str] = Header(default=None),
+) -> str:
+    """Resolve and validate the student's matricula from the request.
+
+    Students pass their matricula as the `api_key` in their OpenAI/LangChain
+    client, which the SDK sends as an `Authorization: Bearer <matricula>`
+    header. This looks up that matricula in Neon and confirms it is
+    registered and active.
+
+    Parameters
+    ----------
+    authorization:
+        The raw `Authorization` header, expected to be
+        ``"Bearer <matricula>"``.
+
+    Returns
+    -------
+    str
+        The validated matricula.
+
+    Raises
+    ------
+    HTTPException
+        401 if the header is missing or malformed, or 403 if the matricula
+        is not registered or is inactive.
+    """
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(
+            status_code=401,
+            detail="Missing bearer token: set your matricula as the api_key",
+        )
+
+    matricula = authorization[len("Bearer "):].strip()
+    if not matricula:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing bearer token: set your matricula as the api_key",
+        )
+
+    if not await is_enrollment_active(matricula):
+        raise HTTPException(
+            status_code=403,
+            detail="Matricula not recognized or inactive",
+        )
+
+    return matricula
+
+
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+    await close_pool()
+
 
 app = FastAPI(
     title="PGL OpenAI Proxy",
@@ -118,11 +176,15 @@ app = FastAPI(
         "use, forwards requests to OpenAI using a key that is never exposed "
         "to student code, and traces every call in Langfuse for monitoring."
     ),
+    lifespan=lifespan,
 )
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(request: Request):
+async def chat_completions(
+    request: Request,
+    matricula: str = Depends(require_active_matricula),
+):
     """Forward a chat completion request to OpenAI on behalf of a student.
 
     This endpoint mirrors OpenAI's ``POST /v1/chat/completions`` so that
@@ -147,8 +209,10 @@ async def chat_completions(request: Request):
     Raises
     ------
     HTTPException
-        400 if the request has no model field, or 403 if the requested
-        model is not in ``ALLOWED_MODELS``.
+        401 if the matricula (sent as the client's ``api_key``) is missing,
+        403 if the matricula is not registered/active or the requested
+        model is not in ``ALLOWED_MODELS``, or 400 if the request has no
+        model field.
     """
     payload = await request.json()
     validate_model(payload.get("model"))

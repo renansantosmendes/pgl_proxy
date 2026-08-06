@@ -1,5 +1,7 @@
-"""Neon-backed lookup of which student matriculas may use the proxy."""
+"""Neon-backed lookup of which student matriculas may use the proxy, and
+enforcement of a per-matricula request rate limit."""
 
+import datetime
 from typing import Optional
 
 import asyncpg
@@ -45,3 +47,84 @@ async def is_enrollment_active(matricula: str) -> bool:
         matricula,
     )
     return row is not None and row["is_active"]
+
+
+async def check_and_increment_rate_limit(
+    matricula: str, max_requests: int, window_seconds: int
+) -> bool:
+    """Atomically check and consume one request of `matricula`'s quota.
+
+    Implements a fixed-window counter in `pgl_proxy.rate_limits`: the row
+    is locked with `FOR UPDATE` before it's read and written, so concurrent
+    requests from the same matricula can't race past the limit.
+
+    Parameters
+    ----------
+    matricula:
+        The student enrollment number making the request.
+    max_requests:
+        How many requests `matricula` may make within `window_seconds`.
+    window_seconds:
+        Length of the fixed window, in seconds.
+
+    Returns
+    -------
+    bool
+        True if the request is within the limit (and has been counted),
+        False if `matricula` has already used up its quota for the current
+        window (the request should be rejected, and is not counted again).
+    """
+    pool = await get_pool()
+    window = datetime.timedelta(seconds=window_seconds)
+
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                """
+                SELECT window_start, request_count
+                FROM pgl_proxy.rate_limits
+                WHERE matricula = $1
+                FOR UPDATE
+                """,
+                matricula,
+            )
+
+            now = datetime.datetime.now(datetime.timezone.utc)
+
+            if row is None:
+                await conn.execute(
+                    """
+                    INSERT INTO pgl_proxy.rate_limits (matricula, window_start, request_count)
+                    VALUES ($1, $2, 1)
+                    """,
+                    matricula,
+                    now,
+                )
+                return True
+
+            window_expired = now - row["window_start"] >= window
+
+            if window_expired:
+                await conn.execute(
+                    """
+                    UPDATE pgl_proxy.rate_limits
+                    SET window_start = $2, request_count = 1
+                    WHERE matricula = $1
+                    """,
+                    matricula,
+                    now,
+                )
+                return True
+
+            if row["request_count"] >= max_requests:
+                return False
+
+            await conn.execute(
+                """
+                UPDATE pgl_proxy.rate_limits
+                SET request_count = request_count + 1
+                WHERE matricula = $1
+                """,
+                matricula,
+            )
+            return True

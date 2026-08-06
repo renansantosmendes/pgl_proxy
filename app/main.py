@@ -42,6 +42,7 @@ Running locally
     uvicorn app.main:app --host 0.0.0.0 --port 8000
 """
 
+import json
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -54,7 +55,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from langfuse.openai import AsyncOpenAI
 
 from app.config import OPENAI_API_KEY
-from app.db import close_pool, is_enrollment_active
+from app.db import check_and_increment_rate_limit, close_pool, is_enrollment_active
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -71,6 +72,43 @@ ALLOWED_MODELS: set[str] = {
     "gpt-5-nano",
     "gpt-5.4-mini",
 }
+
+#: The only OpenAI chat completion fields the proxy will forward. Anything
+#: else in the student's request body is dropped, which both keeps unknown
+#: fields from reaching the OpenAI SDK call and prevents a student payload
+#: from colliding with the `langfuse_*` kwargs this proxy adds itself.
+ALLOWED_PAYLOAD_FIELDS: set[str] = {
+    "model",
+    "messages",
+    "stream",
+    "temperature",
+    "top_p",
+    "max_tokens",
+    "max_completion_tokens",
+    "n",
+    "stop",
+    "presence_penalty",
+    "frequency_penalty",
+    "logit_bias",
+    "user",
+    "seed",
+    "response_format",
+    "tools",
+    "tool_choice",
+}
+
+#: Upper bound on tokens generated per request, to cap cost per call.
+MAX_TOKENS_LIMIT = 2048
+
+#: Upper bound on how many completions a single request may ask for.
+MAX_N = 1
+
+#: Requests larger than this are rejected before being parsed as JSON.
+MAX_REQUEST_BODY_BYTES = 256 * 1024  # 256 KiB
+
+#: Per-matricula request budget enforced in Neon (see app/db.py).
+RATE_LIMIT_MAX_REQUESTS = 20
+RATE_LIMIT_WINDOW_SECONDS = 60
 
 #: Langfuse-instrumented OpenAI client used for every request. Langfuse
 #: picks up its own credentials (LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY,
@@ -160,6 +198,71 @@ async def require_active_matricula(
     return matricula
 
 
+async def enforce_rate_limit(
+    matricula: str = Depends(require_active_matricula),
+) -> str:
+    """Consume one unit of `matricula`'s request budget, or reject.
+
+    Chains onto `require_active_matricula`, so callers get both
+    authentication and rate limiting from a single dependency.
+
+    Raises
+    ------
+    HTTPException
+        429 if `matricula` has already made `RATE_LIMIT_MAX_REQUESTS`
+        requests within the last `RATE_LIMIT_WINDOW_SECONDS`.
+    """
+    allowed = await check_and_increment_rate_limit(
+        matricula, RATE_LIMIT_MAX_REQUESTS, RATE_LIMIT_WINDOW_SECONDS
+    )
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                f"Rate limit exceeded: max {RATE_LIMIT_MAX_REQUESTS} requests "
+                f"per {RATE_LIMIT_WINDOW_SECONDS}s"
+            ),
+        )
+    return matricula
+
+
+def sanitize_payload(payload: dict) -> dict:
+    """Drop unknown fields and enforce cost caps on the request body.
+
+    Parameters
+    ----------
+    payload:
+        The student's raw JSON request body.
+
+    Returns
+    -------
+    dict
+        Only the keys in `ALLOWED_PAYLOAD_FIELDS`, ready to forward to the
+        OpenAI SDK.
+
+    Raises
+    ------
+    HTTPException
+        400 if `max_tokens`/`max_completion_tokens` exceeds
+        `MAX_TOKENS_LIMIT`, or `n` exceeds `MAX_N`.
+    """
+    sanitized = {k: v for k, v in payload.items() if k in ALLOWED_PAYLOAD_FIELDS}
+
+    for field in ("max_tokens", "max_completion_tokens"):
+        value = sanitized.get(field)
+        if isinstance(value, int) and value > MAX_TOKENS_LIMIT:
+            raise HTTPException(
+                status_code=400,
+                detail=f"'{field}' must be <= {MAX_TOKENS_LIMIT}",
+            )
+
+    n = sanitized.get("n")
+    if isinstance(n, int) and n > MAX_N:
+        raise HTTPException(status_code=400, detail=f"'n' must be <= {MAX_N}")
+
+    return sanitized
+
+
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
@@ -185,7 +288,7 @@ app = FastAPI(
 @app.post("/v1/chat/completions")
 async def chat_completions(
     request: Request,
-    matricula: str = Depends(require_active_matricula),
+    matricula: str = Depends(enforce_rate_limit),
 ):
     """Forward a chat completion request to OpenAI on behalf of a student.
 
@@ -213,10 +316,24 @@ async def chat_completions(
     HTTPException
         401 if the matricula (sent as the client's ``api_key``) is missing,
         403 if the matricula is not registered/active or the requested
-        model is not in ``ALLOWED_MODELS``, or 400 if the request has no
-        model field.
+        model is not in ``ALLOWED_MODELS``, 429 if the matricula's rate
+        limit was exceeded, 413 if the request body is too large, or 400
+        if the request has no model field or exceeds a cost cap.
     """
-    payload = await request.json()
+    body = await request.body()
+    if len(body) > MAX_REQUEST_BODY_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Request body exceeds {MAX_REQUEST_BODY_BYTES} bytes",
+        )
+
+    try:
+        payload = sanitize_payload(json.loads(body))
+    except json.JSONDecodeError:
+        raise HTTPException(
+            status_code=400, detail="Request body is not valid JSON"
+        ) from None
+
     validate_model(payload.get("model"))
 
     is_streaming = payload.get("stream", False)

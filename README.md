@@ -61,7 +61,10 @@ body as OpenAI (`model`, `messages`, `stream`, etc.).
   header).
 - Returns `403` if the matricula is not registered or is inactive, or if
   the requested model is not in the allowlist.
-- Returns `400` if the `model` field is missing.
+- Returns `429` if the matricula has exceeded its request rate limit.
+- Returns `413` if the request body is too large.
+- Returns `400` if the `model` field is missing, the body isn't valid JSON,
+  or `max_tokens`/`n` exceed their caps.
 - Returns the chat completion JSON for regular requests, or relays a
   server-sent events stream when `"stream": true` is set.
 
@@ -75,19 +78,40 @@ The set of models students may request is defined in `ALLOWED_MODELS` in
 [`app/main.py`](app/main.py). Requests for any other model are rejected
 before they reach OpenAI, keeping costs predictable.
 
+## Abuse protection
+
+Beyond the model allowlist, [`app/main.py`](app/main.py) applies a few more
+guardrails before forwarding a request to OpenAI:
+
+- **Payload allowlist** (`ALLOWED_PAYLOAD_FIELDS`): only known OpenAI chat
+  completion fields are forwarded — anything else in the request body is
+  dropped, so a student can't smuggle in unexpected fields (including ones
+  that would collide with the `langfuse_user_id`/`langfuse_metadata` kwargs
+  the proxy adds itself).
+- **Cost caps**: `max_tokens`/`max_completion_tokens` above
+  `MAX_TOKENS_LIMIT` (2048) or `n` above `MAX_N` (1) are rejected with
+  `400`, capping the worst case cost of a single request.
+- **Request body size limit**: bodies over `MAX_REQUEST_BODY_BYTES`
+  (256 KiB) are rejected with `413` before being parsed.
+- **Per-matricula rate limit**: `RATE_LIMIT_MAX_REQUESTS` (20) requests per
+  `RATE_LIMIT_WINDOW_SECONDS` (60) window, enforced atomically in Neon
+  (`pgl_proxy.rate_limits`, see [`app/db.py`](app/db.py)) — this works
+  correctly even across multiple serverless instances, unlike an in-memory
+  counter would.
+
 ## Student authentication (Neon)
 
 Only matriculas registered and marked active in Neon may use the proxy.
 
-1. **Create the schema/table** (once, or whenever
-   [`db/schema.sql`](db/schema.sql) changes):
+1. **Create the schema/tables** (once, or whenever
+   [`db/schema.sql`](db/schema.sql) changes — it's idempotent and never
+   drops existing tables or rows):
 
    ```bash
    python -m scripts.init_db
    ```
 
-   This creates the `pgl_proxy.students` table (dropping it first if it
-   already exists, so re-running this wipes existing rows):
+   This creates `pgl_proxy.students`:
 
    | column          | type          | notes                                  |
    |-----------------|---------------|------------------------------------------|
@@ -100,6 +124,15 @@ Only matriculas registered and marked active in Neon may use the proxy.
    | `role`          | `text`        | from Canvas "Papel"                     |
    | `is_active`     | `boolean`     | defaults to `true`                     |
    | `last_modified` | `timestamptz` | auto-updated by a trigger on `UPDATE`  |
+
+   ...and `pgl_proxy.rate_limits`, used by the abuse-protection rate
+   limiter (see above):
+
+   | column          | type          | notes                                  |
+   |-----------------|---------------|------------------------------------------|
+   | `matricula`     | `text`        | primary key, references `students`     |
+   | `window_start`  | `timestamptz` | start of the current fixed window      |
+   | `request_count` | `int`         | requests counted in the current window |
 
 2. **Manage matriculas** with the companion CLI:
 

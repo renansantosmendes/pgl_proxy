@@ -44,7 +44,19 @@ def mock_is_enrollment_active(monkeypatch):
 
 
 @pytest.fixture
-def authenticated_client(client, mock_is_enrollment_active):
+def mock_check_rate_limit(monkeypatch):
+    """Replace the Neon rate limiter with an AsyncMock that always allows.
+
+    Tests that need to simulate an exhausted quota can set
+    `mock.return_value = False` (or a `side_effect`).
+    """
+    mock = AsyncMock(return_value=True)
+    monkeypatch.setattr(app_main, "check_and_increment_rate_limit", mock)
+    return mock
+
+
+@pytest.fixture
+def authenticated_client(client, mock_is_enrollment_active, mock_check_rate_limit):
     """A TestClient that already sends a valid matricula as the api_key."""
     client.headers["Authorization"] = f"Bearer {ACTIVE_MATRICULA}"
     return client

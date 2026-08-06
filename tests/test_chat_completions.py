@@ -140,3 +140,86 @@ def test_openai_error_propagates_as_500(authenticated_client, mock_openai_create
                 "messages": [{"role": "user", "content": "hi"}],
             },
         )
+
+
+def test_rate_limit_exceeded_returns_429(authenticated_client, mock_check_rate_limit):
+    mock_check_rate_limit.return_value = False
+
+    response = authenticated_client.post(
+        "/v1/chat/completions",
+        json={"model": "gpt-4o-mini", "messages": []},
+    )
+
+    assert response.status_code == 429
+
+
+def test_oversized_body_returns_413(authenticated_client):
+    from app.main import MAX_REQUEST_BODY_BYTES
+
+    huge_content = "x" * (MAX_REQUEST_BODY_BYTES + 1)
+
+    response = authenticated_client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "gpt-4o-mini",
+            "messages": [{"role": "user", "content": huge_content}],
+        },
+    )
+
+    assert response.status_code == 413
+
+
+def test_invalid_json_body_returns_400(authenticated_client):
+    response = authenticated_client.post(
+        "/v1/chat/completions",
+        content=b"not json",
+        headers={"Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 400
+
+
+def test_excessive_max_tokens_returns_400(authenticated_client):
+    response = authenticated_client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "gpt-4o-mini",
+            "messages": [],
+            "max_tokens": 999999,
+        },
+    )
+
+    assert response.status_code == 400
+
+
+def test_excessive_n_returns_400(authenticated_client):
+    response = authenticated_client.post(
+        "/v1/chat/completions",
+        json={"model": "gpt-4o-mini", "messages": [], "n": 5},
+    )
+
+    assert response.status_code == 400
+
+
+def test_unknown_fields_are_dropped_before_forwarding(
+    authenticated_client, mock_openai_create
+):
+    mock_openai_create.return_value = make_completion("42")
+
+    response = authenticated_client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "gpt-4o-mini",
+            "messages": [{"role": "user", "content": "hi"}],
+            "langfuse_user_id": "someone-else",
+            "some_unexpected_field": "should be dropped",
+        },
+    )
+
+    assert response.status_code == 200
+    mock_openai_create.assert_awaited_once_with(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": "hi"}],
+        langfuse_user_id=ACTIVE_MATRICULA,
+        langfuse_metadata={"matricula": ACTIVE_MATRICULA},
+    )

@@ -1,12 +1,9 @@
 """
 init_db.py
 
-Creates the `pgl_proxy` schema and the `students` table in Neon. Run this
-once before starting the proxy for the first time.
-
-WARNING: db/schema.sql drops and recreates the `students` table, so
-re-running this script wipes any rows already registered. Re-register
-matriculas with scripts/manage_students.py afterwards.
+Creates the `pgl_proxy` schema and its tables (`students`, `rate_limits`)
+in Neon. Idempotent — safe to run multiple times, including after
+db/schema.sql changes; it never drops existing tables or rows.
 
 Usage
 -----
@@ -32,7 +29,7 @@ async def main() -> None:
     finally:
         await conn.close()
 
-    print("Schema 'pgl_proxy' and table 'students' are ready.")
+    print("Schema 'pgl_proxy' and its tables are ready.")
 
 
 if __name__ == "__main__":

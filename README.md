@@ -9,11 +9,13 @@ monitoring (cost, latency, prompts, completions, errors).
 
 1. Students configure LangChain's `ChatOpenAI` (or the raw OpenAI SDK) to
    point at this proxy (`base_url="http://your-server:8000/v1"`), setting
-   their **matricula** (enrollment number) as the `api_key`. The SDK sends
-   it as an `Authorization: Bearer <matricula>` header.
-2. The server checks that matricula against the `pgl_proxy.students` table
-   in [Neon](https://neon.tech) (must exist and be marked active), then
-   validates the requested model against an allowlist, then uses the
+   `"<matricula>:<senha>"` (enrollment number and password) as the
+   `api_key`. The SDK sends it as an
+   `Authorization: Bearer <matricula>:<senha>` header.
+2. The server checks that matricula/senha against the `pgl_proxy.students`
+   table in [Neon](https://neon.tech) (matricula must exist, be marked
+   active, and senha must match its stored hash), then validates the
+   requested model against an allowlist, then uses the
    **real** OpenAI API key (read from an environment variable) to call
    OpenAI via the Langfuse-instrumented OpenAI SDK client.
 3. The real OpenAI key lives only on the server and is never sent to, or
@@ -34,7 +36,8 @@ db/
   schema.sql            DDL for the pgl_proxy.students table
 scripts/
   init_db.py             Creates the schema/table in Neon (run once)
-  manage_students.py      CLI to add/activate/deactivate/list matriculas
+  manage_students.py      CLI to add/activate/deactivate/list matriculas,
+                           and set/reset their passwords
 tests/
   conftest.py        Shared fixtures (test client, mocked OpenAI/Neon calls)
   test_health.py      Tests for GET /health
@@ -54,13 +57,13 @@ requirements-dev.txt  Runtime + test dependencies
 
 Mirrors OpenAI's `POST /v1/chat/completions` so LangChain's `ChatOpenAI` (or
 the raw OpenAI SDK) can talk to it without any code changes beyond setting
-`base_url` and `api_key` (the student's matricula). Accepts the same JSON
-body as OpenAI (`model`, `messages`, `stream`, etc.).
+`base_url` and `api_key` (the student's `"matricula:senha"`). Accepts the
+same JSON body as OpenAI (`model`, `messages`, `stream`, etc.).
 
-- Returns `401` if no matricula was sent (missing/malformed `Authorization`
-  header).
-- Returns `403` if the matricula is not registered or is inactive, or if
-  the requested model is not in the allowlist.
+- Returns `401` if no matricula/senha was sent (missing/malformed
+  `Authorization` header, or `api_key` isn't `"matricula:senha"`).
+- Returns `403` if the matricula/senha is invalid, the matricula is
+  inactive, or the requested model is not in the allowlist.
 - Returns `429` if the matricula has exceeded its request rate limit.
 - Returns `413` if the request body is too large.
 - Returns `400` if the `model` field is missing, the body isn't valid JSON,
@@ -101,7 +104,8 @@ guardrails before forwarding a request to OpenAI:
 
 ## Student authentication (Neon)
 
-Only matriculas registered and marked active in Neon may use the proxy.
+Only matriculas registered, marked active, and with a password set in Neon
+may use the proxy.
 
 1. **Create the schema/tables** (once, or whenever
    [`db/schema.sql`](db/schema.sql) changes — it's idempotent and never
@@ -122,6 +126,7 @@ Only matriculas registered and marked active in Neon may use the proxy.
    | `sis_id`        | `text`        | from Canvas "ID do SIS"                 |
    | `course`        | `text`        | from Canvas "Seção"                     |
    | `role`          | `text`        | from Canvas "Papel"                     |
+   | `password_hash` | `text`        | bcrypt hash, set via `manage_students set-password` |
    | `is_active`     | `boolean`     | defaults to `true`                     |
    | `last_modified` | `timestamptz` | auto-updated by a trigger on `UPDATE`  |
 
@@ -140,8 +145,13 @@ Only matriculas registered and marked active in Neon may use the proxy.
    python -m scripts.manage_students add 20231001 20231002
    python -m scripts.manage_students deactivate 20231001
    python -m scripts.manage_students activate 20231001
+   python -m scripts.manage_students set-password 20231001
    python -m scripts.manage_students list
    ```
+
+   `set-password` prompts (via `getpass`, so it isn't echoed or stored in
+   shell history) for the student's senha and stores its bcrypt hash. A
+   matricula cannot authenticate until a password has been set.
 
    For a full roster export from Canvas ("People" page → export as CSV,
    or transcribed into [`db/roster.csv`](db/roster.csv) with columns
@@ -152,8 +162,9 @@ Only matriculas registered and marked active in Neon may use the proxy.
    python -m scripts.import_students_csv db/roster.csv
    ```
 
-3. Students set their matricula as `api_key` when configuring their client,
-   e.g. `ChatOpenAI(base_url="http://your-server:8000/v1", api_key="20231001")`.
+3. Students set `"matricula:senha"` as `api_key` when configuring their
+   client, e.g.
+   `ChatOpenAI(base_url="http://your-server:8000/v1", api_key="20231001:their-senha")`.
 
 ## Running locally
 

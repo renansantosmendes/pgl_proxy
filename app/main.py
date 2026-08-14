@@ -24,12 +24,14 @@ How it works
 
 Authentication
 --------------
-Students authenticate with their matricula (enrollment number), passed as
-the `api_key` in their OpenAI/LangChain client (`ChatOpenAI(api_key="...")`).
-The SDK sends it as `Authorization: Bearer <matricula>`, which this server
-checks against the `pgl_proxy.students` table in Neon: the matricula must
-exist and be marked active. See db/schema.sql and scripts/init_db.py to set
-up that table, and scripts/manage_students.py to register matriculas.
+Students authenticate with `"<matricula>:<senha>"` (enrollment number and
+password), passed as the `api_key` in their OpenAI/LangChain client
+(`ChatOpenAI(api_key="matricula:senha")`). The SDK sends it as
+`Authorization: Bearer <matricula>:<senha>`, which this server checks
+against the `pgl_proxy.students` table in Neon: the matricula must exist,
+be marked active, and `senha` must match its stored bcrypt hash. See
+db/schema.sql and scripts/init_db.py to set up that table, and
+scripts/manage_students.py to register matriculas and set passwords.
 
 Running locally
 ----------------
@@ -57,7 +59,11 @@ from langfuse import propagate_attributes
 from langfuse.openai import AsyncOpenAI
 
 from app.config import OPENAI_API_KEY
-from app.db import check_and_increment_rate_limit, close_pool, is_enrollment_active
+from app.db import (
+    check_and_increment_rate_limit,
+    close_pool,
+    verify_student_credentials,
+)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -154,18 +160,19 @@ def validate_model(model_name: Optional[str]) -> None:
 async def require_active_matricula(
     authorization: Optional[str] = Header(default=None),
 ) -> str:
-    """Resolve and validate the student's matricula from the request.
+    """Resolve and validate the student's matricula/senha from the request.
 
-    Students pass their matricula as the `api_key` in their OpenAI/LangChain
-    client, which the SDK sends as an `Authorization: Bearer <matricula>`
-    header. This looks up that matricula in Neon and confirms it is
-    registered and active.
+    Students pass ``"<matricula>:<senha>"`` as the `api_key` in their
+    OpenAI/LangChain client, which the SDK sends as an
+    ``Authorization: Bearer <matricula>:<senha>`` header. This looks up
+    the matricula in Neon and confirms it is registered, active, and that
+    `senha` matches its stored password.
 
     Parameters
     ----------
     authorization:
         The raw `Authorization` header, expected to be
-        ``"Bearer <matricula>"``.
+        ``"Bearer <matricula>:<senha>"``.
 
     Returns
     -------
@@ -175,26 +182,29 @@ async def require_active_matricula(
     Raises
     ------
     HTTPException
-        401 if the header is missing or malformed, or 403 if the matricula
-        is not registered or is inactive.
+        401 if the header is missing/malformed or the credentials are
+        invalid, or 403 if the matricula is not registered or is inactive.
     """
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(
             status_code=401,
-            detail="Missing bearer token: set your matricula as the api_key",
+            detail="Missing bearer token: set 'matricula:senha' as the api_key",
         )
 
-    matricula = authorization[len("Bearer "):].strip()
-    if not matricula:
+    token = authorization[len("Bearer "):].strip()
+    matricula, _, senha = token.partition(":")
+    matricula = matricula.strip()
+    senha = senha.strip()
+    if not matricula or not senha:
         raise HTTPException(
             status_code=401,
-            detail="Missing bearer token: set your matricula as the api_key",
+            detail="Malformed bearer token: expected api_key='matricula:senha'",
         )
 
-    if not await is_enrollment_active(matricula):
+    if not await verify_student_credentials(matricula, senha):
         raise HTTPException(
             status_code=403,
-            detail="Matricula not recognized or inactive",
+            detail="Invalid matricula/senha, or matricula is inactive",
         )
 
     return matricula
@@ -316,11 +326,12 @@ async def chat_completions(
     Raises
     ------
     HTTPException
-        401 if the matricula (sent as the client's ``api_key``) is missing,
-        403 if the matricula is not registered/active or the requested
-        model is not in ``ALLOWED_MODELS``, 429 if the matricula's rate
-        limit was exceeded, 413 if the request body is too large, or 400
-        if the request has no model field or exceeds a cost cap.
+        401 if the matricula/senha (sent as the client's ``api_key``) is
+        missing or malformed, 403 if the credentials are invalid, the
+        matricula is inactive, or the requested model is not in
+        ``ALLOWED_MODELS``, 429 if the matricula's rate limit was
+        exceeded, 413 if the request body is too large, or 400 if the
+        request has no model field or exceeds a cost cap.
     """
     body = await request.body()
     if len(body) > MAX_REQUEST_BODY_BYTES:

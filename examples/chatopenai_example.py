@@ -1,8 +1,9 @@
 """
 Example: using the PGL OpenAI Proxy with LangChain's ChatOpenAI.
 
-The `api_key` is the student's matricula (registered and active in Neon),
-not a real OpenAI key. `base_url` points at the proxy instead of OpenAI.
+The `api_key` is `"<matricula>:<senha>"` (the student's enrollment number
+and password, registered in Neon), not a real OpenAI key. `base_url`
+points at the proxy instead of OpenAI.
 
 Usage
 -----
@@ -14,7 +15,7 @@ from langchain_openai import ChatOpenAI
 
 llm = ChatOpenAI(
     base_url="http://localhost:8000/v1",
-    api_key="1121387",  # the student's matricula
+    api_key="1121387:597582",  # "<matricula>:<senha>"
     model="gpt-4o-mini",
 )
 

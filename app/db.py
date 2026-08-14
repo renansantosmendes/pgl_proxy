@@ -5,6 +5,7 @@ import datetime
 from typing import Optional
 
 import asyncpg
+import bcrypt
 
 from app.config import NEON_DATABASE_URL
 
@@ -27,26 +28,32 @@ async def close_pool() -> None:
         _pool = None
 
 
-async def is_enrollment_active(matricula: str) -> bool:
-    """Check whether `matricula` is registered and active in Neon.
+async def verify_student_credentials(matricula: str, senha: str) -> bool:
+    """Check whether `matricula`/`senha` is a valid, active student login.
 
     Parameters
     ----------
     matricula:
         The student enrollment number to look up.
+    senha:
+        The plaintext password to verify against the stored bcrypt hash.
 
     Returns
     -------
     bool
-        True if a row exists for `matricula` with `is_active = true`,
-        False otherwise (including when the matricula is unknown).
+        True if `matricula` exists, is active, has a password set, and
+        `senha` matches its stored hash. False otherwise (including when
+        the matricula is unknown or has no password configured).
     """
     pool = await get_pool()
     row = await pool.fetchrow(
-        "SELECT is_active FROM pgl_proxy.students WHERE matricula = $1",
+        "SELECT is_active, password_hash FROM pgl_proxy.students WHERE matricula = $1",
         matricula,
     )
-    return row is not None and row["is_active"]
+    if row is None or not row["is_active"] or not row["password_hash"]:
+        return False
+
+    return bcrypt.checkpw(senha.encode("utf-8"), row["password_hash"].encode("utf-8"))
 
 
 async def check_and_increment_rate_limit(

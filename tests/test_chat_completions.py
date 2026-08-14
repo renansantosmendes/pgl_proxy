@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from conftest import ACTIVE_MATRICULA
+from conftest import ACTIVE_REGISTRATION_NUMBER
 
 
 def make_completion(content: str = "hello from mock"):
@@ -55,7 +55,7 @@ def test_missing_authorization_returns_401(client):
     assert response.status_code == 401
 
 
-def test_inactive_or_unknown_matricula_returns_403(client, mock_is_enrollment_active):
+def test_inactive_or_unknown_registration_number_returns_403(client, mock_is_enrollment_active):
     from conftest import make_token
 
     client.headers["Authorization"] = f"Bearer {make_token('00000000')}"
@@ -102,7 +102,7 @@ def test_allowed_model_forwards_to_openai_and_returns_completion(
     mock_openai_create.assert_awaited_once_with(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": "What is the answer?"}],
-        metadata={"matricula": ACTIVE_MATRICULA},
+        metadata={"registration_number": ACTIVE_REGISTRATION_NUMBER},
     )
 
 
@@ -212,7 +212,7 @@ def test_unknown_fields_are_dropped_before_forwarding(
         json={
             "model": "gpt-4o-mini",
             "messages": [{"role": "user", "content": "hi"}],
-            "metadata": {"matricula": "someone-else"},
+            "metadata": {"registration_number": "someone-else"},
             "some_unexpected_field": "should be dropped",
         },
     )
@@ -221,5 +221,5 @@ def test_unknown_fields_are_dropped_before_forwarding(
     mock_openai_create.assert_awaited_once_with(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": "hi"}],
-        metadata={"matricula": ACTIVE_MATRICULA},
+        metadata={"registration_number": ACTIVE_REGISTRATION_NUMBER},
     )

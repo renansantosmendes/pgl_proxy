@@ -2,8 +2,8 @@
 Example: using the PGL OpenAI Proxy with LangChain's ChatOpenAI.
 
 The `api_key` is a short-lived JWT obtained from `pgl_auth_server`, not the
-student's raw matricula/senha and not a real OpenAI key. `base_url` points
-at the proxy instead of OpenAI.
+student's raw registration_number/senha and not a real OpenAI key.
+`base_url` points at the proxy instead of OpenAI.
 
 Usage
 -----
@@ -14,9 +14,9 @@ Usage
 from langchain_openai import ChatOpenAI
 from pgl_auth import PGLAuthClient
 
-# Exchanges matricula/senha for a JWT via pgl_auth_server; never sent to,
-# or stored by, this proxy.
-token = PGLAuthClient().login(matricula="1121387", senha="597582")
+# Exchanges registration_number/senha for a JWT via pgl_auth_server; never
+# sent to, or stored by, this proxy.
+token = PGLAuthClient().login(registration_number="1121387", senha="597582")
 
 llm = ChatOpenAI(
     base_url="http://localhost:8000/v1",

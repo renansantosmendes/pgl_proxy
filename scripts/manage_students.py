@@ -1,8 +1,8 @@
 """
 manage_students.py
 
-Small CLI to register and manage which student matriculas may use the
-proxy. Run `python -m scripts.init_db` first to create the table.
+Small CLI to register and manage which student registration numbers may
+use the proxy. Run `python -m scripts.init_db` first to create the table.
 
 Usage
 -----
@@ -23,41 +23,41 @@ import asyncpg
 from app.config import NEON_DATABASE_URL
 
 
-async def add(matriculas: list[str]) -> None:
+async def add(registration_numbers: list[str]) -> None:
     conn = await asyncpg.connect(NEON_DATABASE_URL)
     try:
         await conn.executemany(
             """
-            INSERT INTO pgl_proxy.students (matricula)
+            INSERT INTO pgl_proxy.students (registration_number)
             VALUES ($1)
-            ON CONFLICT (matricula) DO NOTHING
+            ON CONFLICT (registration_number) DO NOTHING
             """,
-            [(m,) for m in matriculas],
+            [(r,) for r in registration_numbers],
         )
     finally:
         await conn.close()
-    print(f"Added (or already present): {', '.join(matriculas)}")
+    print(f"Added (or already present): {', '.join(registration_numbers)}")
 
 
-async def set_active(matriculas: list[str], is_active: bool) -> None:
+async def set_active(registration_numbers: list[str], is_active: bool) -> None:
     conn = await asyncpg.connect(NEON_DATABASE_URL)
     try:
         await conn.executemany(
-            "UPDATE pgl_proxy.students SET is_active = $2 WHERE matricula = $1",
-            [(m, is_active) for m in matriculas],
+            "UPDATE pgl_proxy.students SET is_active = $2 WHERE registration_number = $1",
+            [(r, is_active) for r in registration_numbers],
         )
     finally:
         await conn.close()
     state = "activated" if is_active else "deactivated"
-    print(f"{state.capitalize()}: {', '.join(matriculas)}")
+    print(f"{state.capitalize()}: {', '.join(registration_numbers)}")
 
 
 async def list_students() -> None:
     conn = await asyncpg.connect(NEON_DATABASE_URL)
     try:
         rows = await conn.fetch(
-            "SELECT matricula, is_active, last_modified "
-            "FROM pgl_proxy.students ORDER BY matricula"
+            "SELECT registration_number, is_active, last_modified "
+            "FROM pgl_proxy.students ORDER BY registration_number"
         )
     finally:
         await conn.close()
@@ -68,34 +68,34 @@ async def list_students() -> None:
 
     for row in rows:
         status = "active" if row["is_active"] else "inactive"
-        print(f"{row['matricula']}\t{status}\t{row['last_modified']}")
+        print(f"{row['registration_number']}\t{status}\t{row['last_modified']}")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    add_parser = subparsers.add_parser("add", help="Register one or more matriculas")
-    add_parser.add_argument("matriculas", nargs="+")
+    add_parser = subparsers.add_parser("add", help="Register one or more registration numbers")
+    add_parser.add_argument("registration_numbers", nargs="+")
 
-    activate_parser = subparsers.add_parser("activate", help="Mark matriculas active")
-    activate_parser.add_argument("matriculas", nargs="+")
+    activate_parser = subparsers.add_parser("activate", help="Mark registration numbers active")
+    activate_parser.add_argument("registration_numbers", nargs="+")
 
     deactivate_parser = subparsers.add_parser(
-        "deactivate", help="Mark matriculas inactive"
+        "deactivate", help="Mark registration numbers inactive"
     )
-    deactivate_parser.add_argument("matriculas", nargs="+")
+    deactivate_parser.add_argument("registration_numbers", nargs="+")
 
-    subparsers.add_parser("list", help="List all registered matriculas")
+    subparsers.add_parser("list", help="List all registered registration numbers")
 
     args = parser.parse_args()
 
     if args.command == "add":
-        asyncio.run(add(args.matriculas))
+        asyncio.run(add(args.registration_numbers))
     elif args.command == "activate":
-        asyncio.run(set_active(args.matriculas, True))
+        asyncio.run(set_active(args.registration_numbers, True))
     elif args.command == "deactivate":
-        asyncio.run(set_active(args.matriculas, False))
+        asyncio.run(set_active(args.registration_numbers, False))
     elif args.command == "list":
         asyncio.run(list_students())
 

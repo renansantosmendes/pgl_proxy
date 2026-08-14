@@ -1,9 +1,9 @@
 """
 import_students_csv.py
 
-Bulk-loads a roster CSV (matricula, full_name, login_id, sis_id, course,
-role) into pgl_proxy.students, upserting by matricula. Every imported row
-is marked active.
+Bulk-loads a roster CSV (registration_number, full_name, login_id, sis_id,
+course, role) into pgl_proxy.students, upserting by registration_number.
+Every imported row is marked active.
 
 Usage
 -----
@@ -25,7 +25,7 @@ def read_roster(csv_path: Path) -> list[tuple[str, str, str, str, str, str]]:
         reader = csv.DictReader(f)
         return [
             (
-                row["matricula"],
+                row["registration_number"],
                 row["full_name"],
                 row["login_id"],
                 row["sis_id"],
@@ -44,9 +44,9 @@ async def main(csv_path: Path) -> None:
         await conn.executemany(
             """
             INSERT INTO pgl_proxy.students
-                (matricula, full_name, login_id, sis_id, course, role, is_active)
+                (registration_number, full_name, login_id, sis_id, course, role, is_active)
             VALUES ($1, $2, $3, $4, $5, $6, TRUE)
-            ON CONFLICT (matricula) DO UPDATE SET
+            ON CONFLICT (registration_number) DO UPDATE SET
                 full_name = EXCLUDED.full_name,
                 login_id  = EXCLUDED.login_id,
                 sis_id    = EXCLUDED.sis_id,

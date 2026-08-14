@@ -23,16 +23,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app import main as app_main  # noqa: E402
 
-#: A matricula used by tests that need a valid, active student without
-#: touching the real Neon database.
-ACTIVE_MATRICULA = "20230001"
+#: A registration number used by tests that need a valid, active student
+#: without touching the real Neon database.
+ACTIVE_REGISTRATION_NUMBER = "20230001"
 
 
-def make_token(matricula: str = ACTIVE_MATRICULA, expires_in: int = 3600) -> str:
+def make_token(registration_number: str = ACTIVE_REGISTRATION_NUMBER, expires_in: int = 3600) -> str:
     """Sign a test JWT the same way pgl_auth_server would, using the test secret."""
     now = int(time.time())
     return jwt.encode(
-        {"sub": matricula, "iat": now, "exp": now + expires_in},
+        {"sub": registration_number, "iat": now, "exp": now + expires_in},
         os.environ["JWT_SECRET_KEY"],
         algorithm="HS256",
     )
@@ -47,11 +47,14 @@ def client():
 def mock_is_enrollment_active(monkeypatch):
     """Replace the Neon lookup with an AsyncMock.
 
-    Defaults to treating `ACTIVE_MATRICULA` as active and everything else
-    as inactive/unknown, mirroring what a real lookup would do. Tests can
-    override `mock.side_effect` for other scenarios.
+    Defaults to treating `ACTIVE_REGISTRATION_NUMBER` as active and
+    everything else as inactive/unknown, mirroring what a real lookup
+    would do. Tests can override `mock.side_effect` for other scenarios.
     """
-    mock = AsyncMock(side_effect=lambda matricula: matricula == ACTIVE_MATRICULA)
+    mock = AsyncMock(
+        side_effect=lambda registration_number: registration_number
+        == ACTIVE_REGISTRATION_NUMBER
+    )
     monkeypatch.setattr(app_main, "is_enrollment_active", mock)
     return mock
 

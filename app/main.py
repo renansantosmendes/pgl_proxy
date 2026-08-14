@@ -18,7 +18,7 @@ How it works
    student code.
 4. Every call is automatically traced in Langfuse: prompts, completions,
    token usage, latency, and errors. Each trace is tagged with the
-   student's matricula as the trace's `user_id` (via
+   student's registration number as the trace's `user_id` (via
    `langfuse.propagate_attributes`), so usage in the Langfuse dashboard can
    be filtered/grouped per student.
 
@@ -29,18 +29,20 @@ their OpenAI/LangChain client (`ChatOpenAI(api_key=token)`). The SDK sends
 it as `Authorization: Bearer <token>`. This server never sees a student's
 password: the token is obtained separately, by the student, from
 `pgl_auth_server` (via the `pgl_auth` PyPI package or its `/api/login`
-endpoint directly), which verifies matricula/senha against `pgl_auth.students`
-and signs a JWT (HS256, ``sub`` = matricula, 4h TTL). This server only:
+endpoint directly), which verifies registration_number/senha against
+`pgl_auth.students` and signs a JWT (HS256, ``sub`` = registration_number,
+4h TTL). This server only:
 
 1. Verifies the token's signature and expiry using the same `JWT_SECRET_KEY`
    (must be configured identically on both services).
-2. Re-checks that the matricula is still active in `pgl_proxy.students` on
-   every request — a token can outlive a mid-window deactivation, so this
-   is the defense-in-depth check against that.
+2. Re-checks that the registration number is still active in
+   `pgl_proxy.students` on every request — a token can outlive a
+   mid-window deactivation, so this is the defense-in-depth check against
+   that.
 
 See db/schema.sql and scripts/init_db.py to set up `pgl_proxy.students`, and
-scripts/manage_students.py to manage which matriculas are enrolled/active
-(this repo only owns enrollment status, not credentials).
+scripts/manage_students.py to manage which registration numbers are
+enrolled/active (this repo only owns enrollment status, not credentials).
 
 Running locally
 ----------------
@@ -121,7 +123,7 @@ MAX_N = 1
 #: Requests larger than this are rejected before being parsed as JSON.
 MAX_REQUEST_BODY_BYTES = 256 * 1024  # 256 KiB
 
-#: Per-matricula request budget enforced in Neon (see app/db.py).
+#: Per-registration_number request budget enforced in Neon (see app/db.py).
 RATE_LIMIT_MAX_REQUESTS = 20
 RATE_LIMIT_WINDOW_SECONDS = 60
 
@@ -164,16 +166,17 @@ def validate_model(model_name: Optional[str]) -> None:
         )
 
 
-async def require_active_matricula(
+async def require_active_registration_number(
     authorization: Optional[str] = Header(default=None),
 ) -> str:
-    """Resolve and validate the student's matricula from a bearer JWT.
+    """Resolve and validate the student's registration number from a bearer JWT.
 
     Students pass the JWT issued by `pgl_auth_server` (after it verifies
-    their matricula/senha) as the `api_key` in their OpenAI/LangChain
-    client, which the SDK sends as an `Authorization: Bearer <token>`
-    header. This verifies the token's signature/expiry, then re-checks
-    that the matricula is still active in Neon.
+    their registration_number/senha) as the `api_key` in their
+    OpenAI/LangChain client, which the SDK sends as an
+    `Authorization: Bearer <token>` header. This verifies the token's
+    signature/expiry, then re-checks that the registration number is
+    still active in Neon.
 
     Parameters
     ----------
@@ -184,13 +187,14 @@ async def require_active_matricula(
     Returns
     -------
     str
-        The validated matricula (the token's ``sub`` claim).
+        The validated registration number (the token's ``sub`` claim).
 
     Raises
     ------
     HTTPException
         401 if the header is missing/malformed or the token is invalid or
-        expired, or 403 if the matricula is not registered or is inactive.
+        expired, or 403 if the registration number is not registered or is
+        inactive.
     """
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(
@@ -215,35 +219,36 @@ async def require_active_matricula(
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid token") from None
 
-    matricula = claims.get("sub")
-    if not matricula:
+    registration_number = claims.get("sub")
+    if not registration_number:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-    if not await is_enrollment_active(matricula):
+    if not await is_enrollment_active(registration_number):
         raise HTTPException(
             status_code=403,
-            detail="Matricula not recognized or inactive",
+            detail="Registration number not recognized or inactive",
         )
 
-    return matricula
+    return registration_number
 
 
 async def enforce_rate_limit(
-    matricula: str = Depends(require_active_matricula),
+    registration_number: str = Depends(require_active_registration_number),
 ) -> str:
-    """Consume one unit of `matricula`'s request budget, or reject.
+    """Consume one unit of `registration_number`'s request budget, or reject.
 
-    Chains onto `require_active_matricula`, so callers get both
+    Chains onto `require_active_registration_number`, so callers get both
     authentication and rate limiting from a single dependency.
 
     Raises
     ------
     HTTPException
-        429 if `matricula` has already made `RATE_LIMIT_MAX_REQUESTS`
-        requests within the last `RATE_LIMIT_WINDOW_SECONDS`.
+        429 if `registration_number` has already made
+        `RATE_LIMIT_MAX_REQUESTS` requests within the last
+        `RATE_LIMIT_WINDOW_SECONDS`.
     """
     allowed = await check_and_increment_rate_limit(
-        matricula, RATE_LIMIT_MAX_REQUESTS, RATE_LIMIT_WINDOW_SECONDS
+        registration_number, RATE_LIMIT_MAX_REQUESTS, RATE_LIMIT_WINDOW_SECONDS
     )
     if not allowed:
         raise HTTPException(
@@ -253,7 +258,7 @@ async def enforce_rate_limit(
                 f"per {RATE_LIMIT_WINDOW_SECONDS}s"
             ),
         )
-    return matricula
+    return registration_number
 
 
 def sanitize_payload(payload: dict) -> dict:
@@ -318,7 +323,7 @@ app = FastAPI(
 @app.post("/v1/chat/completions")
 async def chat_completions(
     request: Request,
-    matricula: str = Depends(enforce_rate_limit),
+    registration_number: str = Depends(enforce_rate_limit),
 ):
     """Forward a chat completion request to OpenAI on behalf of a student.
 
@@ -345,11 +350,11 @@ async def chat_completions(
     ------
     HTTPException
         401 if the bearer token (sent as the client's ``api_key``) is
-        missing, malformed, invalid, or expired, 403 if the matricula is
-        inactive or the requested model is not in ``ALLOWED_MODELS``, 429
-        if the matricula's rate limit was exceeded, 413 if the request
-        body is too large, or 400 if the request has no model field or
-        exceeds a cost cap.
+        missing, malformed, invalid, or expired, 403 if the registration
+        number is inactive or the requested model is not in
+        ``ALLOWED_MODELS``, 429 if the registration number's rate limit
+        was exceeded, 413 if the request body is too large, or 400 if the
+        request has no model field or exceeds a cost cap.
     """
     body = await request.body()
     if len(body) > MAX_REQUEST_BODY_BYTES:
@@ -371,19 +376,19 @@ async def chat_completions(
 
     if is_streaming:
         return StreamingResponse(
-            _stream_chat_completion(payload, matricula),
+            _stream_chat_completion(payload, registration_number),
             media_type="text/event-stream",
         )
 
-    with propagate_attributes(user_id=matricula):
+    with propagate_attributes(user_id=registration_number):
         completion = await openai_client.chat.completions.create(
             **payload,
-            metadata={"matricula": matricula},
+            metadata={"registration_number": registration_number},
         )
     return JSONResponse(content=completion.model_dump())
 
 
-async def _stream_chat_completion(payload: dict, matricula: str):
+async def _stream_chat_completion(payload: dict, registration_number: str):
     """Relay a streaming chat completion from OpenAI chunk by chunk.
 
     Parameters
@@ -391,9 +396,9 @@ async def _stream_chat_completion(payload: dict, matricula: str):
     payload:
         The JSON body of the original student request, forwarded as-is
         (with ``stream`` already set to ``true``) to the OpenAI SDK.
-    matricula:
-        The requesting student's matricula, attached to the Langfuse trace
-        so usage can be attributed to them.
+    registration_number:
+        The requesting student's registration number, attached to the
+        Langfuse trace so usage can be attributed to them.
 
     Yields
     ------
@@ -402,10 +407,10 @@ async def _stream_chat_completion(payload: dict, matricula: str):
         OpenAI's own streaming API produces, so the student's client can
         parse it the way it expects.
     """
-    with propagate_attributes(user_id=matricula):
+    with propagate_attributes(user_id=registration_number):
         stream = await openai_client.chat.completions.create(
             **payload,
-            metadata={"matricula": matricula},
+            metadata={"registration_number": registration_number},
         )
         async for chunk in stream:
             yield f"data: {chunk.model_dump_json()}\n\n".encode("utf-8")

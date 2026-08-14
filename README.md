@@ -9,16 +9,16 @@ monitoring (cost, latency, prompts, completions, errors).
 
 1. Students obtain a short-lived JWT from
    [`pgl_auth_server`](https://pgl-auth-server.vercel.app) — typically via
-   the `pgl_auth` PyPI package (`PGLAuthClient().login(matricula, senha)`),
-   which itself verifies matricula/senha (bcrypt, `pgl_auth.students`) and
-   confirms the matricula is enrolled/active in `pgl_proxy.students`. This
+   the `pgl_auth` PyPI package (`PGLAuthClient().login(registration_number, senha)`),
+   which itself verifies registration_number/senha (bcrypt, `pgl_auth.students`) and
+   confirms the registration number is enrolled/active in `pgl_proxy.students`. This
    proxy is never told the student's password.
 2. Students configure LangChain's `ChatOpenAI` (or the raw OpenAI SDK) to
    point at this proxy (`base_url="http://your-server:8000/v1"`), setting
    that JWT as the `api_key`. The SDK sends it as an
    `Authorization: Bearer <token>` header.
 3. This server verifies the token's signature and expiry (`JWT_SECRET_KEY`,
-   shared with `pgl_auth_server`), re-checks the matricula is still active
+   shared with `pgl_auth_server`), re-checks the registration number is still active
    in Neon (defense in depth against a mid-window deactivation, since the
    token itself stays valid for its whole 4h TTL), validates the requested
    model against an allowlist, then uses the **real** OpenAI API key (read
@@ -28,7 +28,7 @@ monitoring (cost, latency, prompts, completions, errors).
    seen by, student code.
 5. Every call is automatically traced in Langfuse: prompts, completions,
    token usage, latency, and errors — each trace tagged with the student's
-   matricula as `user_id` (via `langfuse.propagate_attributes`), so you can
+   registration number as `user_id` (via `langfuse.propagate_attributes`), so you can
    filter/group usage per student in the Langfuse dashboard.
 
 This repo owns *enrollment* (who's taking the course and currently active)
@@ -40,13 +40,13 @@ but not *credentials* — passwords and token issuance live in the separate
 ```
 app/
   main.py             FastAPI application (the proxy itself)
-  db.py                Neon connection pool + matricula/rate-limit lookups
+  db.py                Neon connection pool + registration-number/rate-limit lookups
   config.py            Environment-derived configuration
 db/
   schema.sql            DDL for the pgl_proxy.students table
 scripts/
   init_db.py             Creates the schema/table in Neon (run once)
-  manage_students.py      CLI to add/activate/deactivate/list matriculas
+  manage_students.py      CLI to add/activate/deactivate/list registration numbers
 tests/
   conftest.py        Shared fixtures (test client, mocked OpenAI/Neon calls)
   test_health.py      Tests for GET /health
@@ -70,9 +70,9 @@ the raw OpenAI SDK) can talk to it without any code changes beyond setting
 the same JSON body as OpenAI (`model`, `messages`, `stream`, etc.).
 
 - Returns `401` if no token was sent, it's malformed, invalid, or expired.
-- Returns `403` if the matricula is inactive, or if the requested model is
+- Returns `403` if the registration number is inactive, or if the requested model is
   not in the allowlist.
-- Returns `429` if the matricula has exceeded its request rate limit.
+- Returns `429` if the registration number has exceeded its request rate limit.
 - Returns `413` if the request body is too large.
 - Returns `400` if the `model` field is missing, the body isn't valid JSON,
   or `max_tokens`/`n` exceed their caps.
@@ -104,7 +104,7 @@ guardrails before forwarding a request to OpenAI:
   `400`, capping the worst case cost of a single request.
 - **Request body size limit**: bodies over `MAX_REQUEST_BODY_BYTES`
   (256 KiB) are rejected with `413` before being parsed.
-- **Per-matricula rate limit**: `RATE_LIMIT_MAX_REQUESTS` (20) requests per
+- **Per-registration-number rate limit**: `RATE_LIMIT_MAX_REQUESTS` (20) requests per
   `RATE_LIMIT_WINDOW_SECONDS` (60) window, enforced atomically in Neon
   (`pgl_proxy.rate_limits`, see [`app/db.py`](app/db.py)) — this works
   correctly even across multiple serverless instances, unlike an in-memory
@@ -112,7 +112,7 @@ guardrails before forwarding a request to OpenAI:
 
 ## Student enrollment (Neon)
 
-Only matriculas registered and marked active in `pgl_proxy.students` may
+Only registration numbers registered and marked active in `pgl_proxy.students` may
 authenticate (whether getting a token from `pgl_auth_server`, or using this
 proxy with one). This repo owns that table; it does not store credentials.
 
@@ -128,7 +128,7 @@ proxy with one). This repo owns that table; it does not store credentials.
 
    | column          | type          | notes                                  |
    |-----------------|---------------|------------------------------------------|
-   | `matricula`     | `text`        | primary key, the enrollment number     |
+   | `registration_number` | `text`  | primary key, the enrollment number     |
    | `id`            | `uuid`        | auto-generated surrogate id            |
    | `full_name`     | `text`        | from Canvas "Nome"                     |
    | `login_id`      | `text`        | from Canvas "ID de Login"               |
@@ -143,11 +143,11 @@ proxy with one). This repo owns that table; it does not store credentials.
 
    | column          | type          | notes                                  |
    |-----------------|---------------|------------------------------------------|
-   | `matricula`     | `text`        | primary key, references `students`     |
+   | `registration_number` | `text`  | primary key, references `students`     |
    | `window_start`  | `timestamptz` | start of the current fixed window      |
    | `request_count` | `int`         | requests counted in the current window |
 
-2. **Manage matriculas** with the companion CLI:
+2. **Manage registration numbers** with the companion CLI:
 
    ```bash
    python -m scripts.manage_students add 20231001 20231002
@@ -158,8 +158,8 @@ proxy with one). This repo owns that table; it does not store credentials.
 
    For a full roster export from Canvas ("People" page → export as CSV,
    or transcribed into [`db/roster.csv`](db/roster.csv) with columns
-   `matricula,full_name,login_id,sis_id,course,role`), bulk-import it
-   instead — this upserts by matricula and marks every imported row active:
+   `registration_number,full_name,login_id,sis_id,course,role`), bulk-import it
+   instead — this upserts by registration_number and marks every imported row active:
 
    ```bash
    python -m scripts.import_students_csv db/roster.csv
@@ -171,7 +171,7 @@ proxy with one). This repo owns that table; it does not store credentials.
 
    ```python
    from pgl_auth import PGLAuthClient
-   token = PGLAuthClient().login(matricula="20231001", senha="...")
+   token = PGLAuthClient().login(registration_number="20231001", senha="...")
 
    ChatOpenAI(base_url="http://your-server:8000/v1", api_key=token)
    ```
@@ -212,9 +212,9 @@ locally with a fixed test `JWT_SECRET_KEY`, matching how `pgl_auth_server`
 signs real ones. It covers:
 
 - The `/health` endpoint.
-- The JWT authentication dependency (`require_active_matricula`):
+- The JWT authentication dependency (`require_active_registration_number`):
   missing/malformed header, invalid/wrong-secret/expired token,
-  inactive/unknown matricula, valid token.
+  inactive/unknown registration number, valid token.
 - The model allowlist validation (`validate_model`).
 - `/v1/chat/completions` for missing auth, missing/disallowed models,
   successful non-streaming completions, streaming (SSE) completions, and

@@ -232,3 +232,6 @@ __marimo__/
 # Local database directories
 db/
 database/
+
+# Claude Code local settings
+.claude/

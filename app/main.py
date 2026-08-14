@@ -50,7 +50,9 @@ from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
+from pydantic import BaseModel, Field
 
 # The Langfuse-wrapped OpenAI client is a drop-in replacement for the
 # official `openai` SDK client: every call made through it is automatically
@@ -58,10 +60,12 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from langfuse import propagate_attributes
 from langfuse.openai import AsyncOpenAI
 
-from app.config import OPENAI_API_KEY
+from app.config import ALLOWED_FRONTEND_ORIGINS, OPENAI_API_KEY
 from app.db import (
+    check_and_increment_keyed_rate_limit,
     check_and_increment_rate_limit,
     close_pool,
+    register_password,
     verify_student_credentials,
 )
 
@@ -118,10 +122,30 @@ MAX_REQUEST_BODY_BYTES = 256 * 1024  # 256 KiB
 RATE_LIMIT_MAX_REQUESTS = 20
 RATE_LIMIT_WINDOW_SECONDS = 60
 
+#: Per-client-IP budget for /v1/register, enforced in Neon. Deliberately
+#: strict and keyed by IP (not matricula) since register attempts happen
+#: before a matricula is known to be valid, which would otherwise let
+#: someone brute-force which matriculas exist.
+REGISTER_RATE_LIMIT_MAX_REQUESTS = 5
+REGISTER_RATE_LIMIT_WINDOW_SECONDS = 300
+
+#: Bounds on the student-chosen password, enforced by RegisterRequest.
+#: bcrypt silently ignores bytes past 72, so the max keeps the stored hash
+#: meaningful over the whole password rather than a truncated prefix.
+MIN_SENHA_LENGTH = 8
+MAX_SENHA_LENGTH = 72
+
 #: Langfuse-instrumented OpenAI client used for every request. Langfuse
 #: picks up its own credentials (LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY,
 #: LANGFUSE_HOST) from environment variables automatically.
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+
+
+class RegisterRequest(BaseModel):
+    """Body of `POST /v1/register`."""
+
+    matricula: str = Field(min_length=1)
+    senha: str = Field(min_length=MIN_SENHA_LENGTH, max_length=MAX_SENHA_LENGTH)
 
 
 # ---------------------------------------------------------------------------
@@ -296,6 +320,18 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Only /v1/register is meant to be called from a browser (pgl-registry-front).
+# /v1/chat/completions is called from student backends/scripts via the
+# OpenAI SDK, not fetch()/XHR, so it doesn't need (or get) CORS headers.
+# With no origins configured, browsers can't call /v1/register at all.
+if ALLOWED_FRONTEND_ORIGINS:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=ALLOWED_FRONTEND_ORIGINS,
+        allow_methods=["POST"],
+        allow_headers=["Content-Type"],
+    )
+
 
 @app.post("/v1/chat/completions")
 async def chat_completions(
@@ -392,6 +428,67 @@ async def _stream_chat_completion(payload: dict, matricula: str):
         async for chunk in stream:
             yield f"data: {chunk.model_dump_json()}\n\n".encode("utf-8")
     yield b"data: [DONE]\n\n"
+
+
+@app.post("/v1/register")
+async def register(payload: RegisterRequest, request: Request):
+    """Let a student set their password for the first time.
+
+    Intended to be called from the pgl-registry-front web page, not from
+    student LangChain/OpenAI SDK code. Only works once per matricula: if a
+    password is already set, this returns 409 and the student (or an
+    instructor) must use another path to change it, since `matricula`
+    alone isn't a secret and can't prove ownership of an existing account.
+
+    Parameters
+    ----------
+    payload:
+        ``{"matricula": ..., "senha": ...}``.
+    request:
+        Used only to read the client's IP for rate limiting.
+
+    Returns
+    -------
+    dict
+        ``{"status": "ok"}`` on success.
+
+    Raises
+    ------
+    HTTPException
+        429 if this client IP has registered too many times recently, 404
+        if the matricula isn't a registered/active student, or 409 if it
+        already has a password set.
+    """
+    client_ip = request.client.host if request.client else "unknown"
+    allowed = await check_and_increment_keyed_rate_limit(
+        f"register-ip:{client_ip}",
+        REGISTER_RATE_LIMIT_MAX_REQUESTS,
+        REGISTER_RATE_LIMIT_WINDOW_SECONDS,
+    )
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                f"Too many registration attempts: max "
+                f"{REGISTER_RATE_LIMIT_MAX_REQUESTS} per "
+                f"{REGISTER_RATE_LIMIT_WINDOW_SECONDS}s"
+            ),
+        )
+
+    status = await register_password(payload.matricula.strip(), payload.senha)
+
+    if status == "not_found_or_inactive":
+        raise HTTPException(
+            status_code=404,
+            detail="Matrícula não encontrada ou inativa. Fale com o professor.",
+        )
+    if status == "already_registered":
+        raise HTTPException(
+            status_code=409,
+            detail="Essa matrícula já possui uma senha cadastrada.",
+        )
+
+    return {"status": "ok"}
 
 
 @app.get("/health")

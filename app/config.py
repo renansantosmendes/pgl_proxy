@@ -10,3 +10,13 @@ OPENAI_API_KEY: str = os.environ["OPENAI_API_KEY"]
 #: Neon Postgres connection string used to look up which student matriculas
 #: are allowed to use the proxy.
 NEON_DATABASE_URL: str = os.environ["NEON_DATABASE_URL"]
+
+#: Comma-separated list of origins allowed to call the browser-facing
+#: endpoints (currently just /v1/register) via CORS, e.g. the deployed
+#: pgl-registry-front URL. Empty by default, which leaves those endpoints
+#: unreachable from any browser page until explicitly configured.
+ALLOWED_FRONTEND_ORIGINS: list[str] = [
+    origin.strip()
+    for origin in os.environ.get("ALLOWED_FRONTEND_ORIGINS", "").split(",")
+    if origin.strip()
+]

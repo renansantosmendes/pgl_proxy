@@ -71,6 +71,31 @@ same JSON body as OpenAI (`model`, `messages`, `stream`, etc.).
 - Returns the chat completion JSON for regular requests, or relays a
   server-sent events stream when `"stream": true` is set.
 
+### `POST /v1/register`
+
+Lets a student set their password for the first time. Meant to be called
+from a browser (e.g. the companion `pgl-registry-front` page) via
+`fetch()`, not from student LangChain/OpenAI SDK code — so it's the only
+endpoint with CORS enabled, restricted to the origins listed in
+`ALLOWED_FRONTEND_ORIGINS`.
+
+Body: `{"matricula": "20231001", "senha": "..."}` (senha 8–72 chars).
+
+- Returns `200 {"status": "ok"}` on success.
+- Returns `404` if the matricula isn't registered/active in
+  `pgl_proxy.students` (see [Student authentication](#student-authentication-neon)
+  below — it must already exist, e.g. from `import_students_csv`).
+- Returns `409` if that matricula already has a password set. There is no
+  self-service reset: matricula alone isn't a secret, so anyone could
+  otherwise hijack another student's account by "resetting" it. Use
+  `python -m scripts.manage_students set-password <matricula>` to reset
+  one as an instructor.
+- Returns `429` if the calling IP has registered too many times recently
+  (`REGISTER_RATE_LIMIT_MAX_REQUESTS` per `REGISTER_RATE_LIMIT_WINDOW_SECONDS`,
+  see [`app/main.py`](app/main.py)) — this also throttles brute-forcing
+  which matriculas exist.
+- Returns `422` if `senha` is missing or outside 8–72 characters.
+
 ### `GET /health`
 
 Simple liveness check. Returns `{"status": "ok"}`.
@@ -225,6 +250,9 @@ before deploying:
 - `LANGFUSE_SECRET_KEY`
 - `LANGFUSE_HOST`
 - `NEON_DATABASE_URL`
+- `ALLOWED_FRONTEND_ORIGINS` — comma-separated origins allowed to call
+  `/v1/register` via CORS, e.g. `https://pgl-registry-front.vercel.app`.
+  Leave unset to keep `/v1/register` unreachable from any browser page.
 
 > **Streaming caveat:** Vercel serverless functions have an execution time
 > limit (10s on the free plan, longer on paid plans). If streamed OpenAI

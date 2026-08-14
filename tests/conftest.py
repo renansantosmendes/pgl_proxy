@@ -67,6 +67,26 @@ def authenticated_client(client, mock_verify_student_credentials, mock_check_rat
 
 
 @pytest.fixture
+def mock_register_password(monkeypatch):
+    """Replace the Neon register-password call with an AsyncMock.
+
+    Defaults to returning "ok". Tests override `mock.return_value` for
+    "not_found_or_inactive" / "already_registered" scenarios.
+    """
+    mock = AsyncMock(return_value="ok")
+    monkeypatch.setattr(app_main, "register_password", mock)
+    return mock
+
+
+@pytest.fixture
+def mock_check_keyed_rate_limit(monkeypatch):
+    """Replace the Neon keyed rate limiter with an AsyncMock that always allows."""
+    mock = AsyncMock(return_value=True)
+    monkeypatch.setattr(app_main, "check_and_increment_keyed_rate_limit", mock)
+    return mock
+
+
+@pytest.fixture
 def mock_openai_create(monkeypatch):
     """Replace the OpenAI chat completions call with an AsyncMock.
 

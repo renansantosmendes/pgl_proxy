@@ -1,21 +1,26 @@
 """
 Example: using the PGL OpenAI Proxy with LangChain's ChatOpenAI.
 
-The `api_key` is `"<matricula>:<senha>"` (the student's enrollment number
-and password, registered in Neon), not a real OpenAI key. `base_url`
-points at the proxy instead of OpenAI.
+The `api_key` is a short-lived JWT obtained from `pgl_auth_server`, not the
+student's raw matricula/senha and not a real OpenAI key. `base_url` points
+at the proxy instead of OpenAI.
 
 Usage
 -----
-    pip install langchain-openai
+    pip install langchain-openai pgl-auth
     python -m examples.chatopenai_example
 """
 
 from langchain_openai import ChatOpenAI
+from pgl_auth import PGLAuthClient
+
+# Exchanges matricula/senha for a JWT via pgl_auth_server; never sent to,
+# or stored by, this proxy.
+token = PGLAuthClient().login(matricula="1121387", senha="597582")
 
 llm = ChatOpenAI(
     base_url="http://localhost:8000/v1",
-    api_key="1121387:597582",  # "<matricula>:<senha>"
+    api_key=token,
     model="gpt-4o-mini",
 )
 

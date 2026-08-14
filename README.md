@@ -7,41 +7,50 @@ monitoring (cost, latency, prompts, completions, errors).
 
 ## How it works
 
-1. Students configure LangChain's `ChatOpenAI` (or the raw OpenAI SDK) to
+1. Students obtain a short-lived JWT from
+   [`pgl_auth_server`](https://pgl-auth-server.vercel.app) — typically via
+   the `pgl_auth` PyPI package (`PGLAuthClient().login(matricula, senha)`),
+   which itself verifies matricula/senha (bcrypt, `pgl_auth.students`) and
+   confirms the matricula is enrolled/active in `pgl_proxy.students`. This
+   proxy is never told the student's password.
+2. Students configure LangChain's `ChatOpenAI` (or the raw OpenAI SDK) to
    point at this proxy (`base_url="http://your-server:8000/v1"`), setting
-   `"<matricula>:<senha>"` (enrollment number and password) as the
-   `api_key`. The SDK sends it as an
-   `Authorization: Bearer <matricula>:<senha>` header.
-2. The server checks that matricula/senha against the `pgl_proxy.students`
-   table in [Neon](https://neon.tech) (matricula must exist, be marked
-   active, and senha must match its stored hash), then validates the
-   requested model against an allowlist, then uses the
-   **real** OpenAI API key (read from an environment variable) to call
-   OpenAI via the Langfuse-instrumented OpenAI SDK client.
-3. The real OpenAI key lives only on the server and is never sent to, or
+   that JWT as the `api_key`. The SDK sends it as an
+   `Authorization: Bearer <token>` header.
+3. This server verifies the token's signature and expiry (`JWT_SECRET_KEY`,
+   shared with `pgl_auth_server`), re-checks the matricula is still active
+   in Neon (defense in depth against a mid-window deactivation, since the
+   token itself stays valid for its whole 4h TTL), validates the requested
+   model against an allowlist, then uses the **real** OpenAI API key (read
+   from an environment variable) to call OpenAI via the
+   Langfuse-instrumented OpenAI SDK client.
+4. The real OpenAI key lives only on the server and is never sent to, or
    seen by, student code.
-4. Every call is automatically traced in Langfuse: prompts, completions,
+5. Every call is automatically traced in Langfuse: prompts, completions,
    token usage, latency, and errors — each trace tagged with the student's
    matricula as `user_id` (via `langfuse.propagate_attributes`), so you can
    filter/group usage per student in the Langfuse dashboard.
+
+This repo owns *enrollment* (who's taking the course and currently active)
+but not *credentials* — passwords and token issuance live in the separate
+`pgl_auth` (client library) / `pgl_auth_server` (token-issuing API) repos.
 
 ## Project structure
 
 ```
 app/
   main.py             FastAPI application (the proxy itself)
-  db.py                Neon connection pool + matricula lookup
+  db.py                Neon connection pool + matricula/rate-limit lookups
   config.py            Environment-derived configuration
 db/
   schema.sql            DDL for the pgl_proxy.students table
 scripts/
   init_db.py             Creates the schema/table in Neon (run once)
-  manage_students.py      CLI to add/activate/deactivate/list matriculas,
-                           and set/reset their passwords
+  manage_students.py      CLI to add/activate/deactivate/list matriculas
 tests/
   conftest.py        Shared fixtures (test client, mocked OpenAI/Neon calls)
   test_health.py      Tests for GET /health
-  test_auth.py         Tests for the matricula authentication dependency
+  test_auth.py         Tests for the JWT authentication dependency
   test_validate_model.py    Tests for the model allowlist logic
   test_chat_completions.py  Tests for POST /v1/chat/completions
 .github/workflows/
@@ -57,44 +66,18 @@ requirements-dev.txt  Runtime + test dependencies
 
 Mirrors OpenAI's `POST /v1/chat/completions` so LangChain's `ChatOpenAI` (or
 the raw OpenAI SDK) can talk to it without any code changes beyond setting
-`base_url` and `api_key` (the student's `"matricula:senha"`). Accepts the
-same JSON body as OpenAI (`model`, `messages`, `stream`, etc.).
+`base_url` and `api_key` (the student's JWT from `pgl_auth_server`). Accepts
+the same JSON body as OpenAI (`model`, `messages`, `stream`, etc.).
 
-- Returns `401` if no matricula/senha was sent (missing/malformed
-  `Authorization` header, or `api_key` isn't `"matricula:senha"`).
-- Returns `403` if the matricula/senha is invalid, the matricula is
-  inactive, or the requested model is not in the allowlist.
+- Returns `401` if no token was sent, it's malformed, invalid, or expired.
+- Returns `403` if the matricula is inactive, or if the requested model is
+  not in the allowlist.
 - Returns `429` if the matricula has exceeded its request rate limit.
 - Returns `413` if the request body is too large.
 - Returns `400` if the `model` field is missing, the body isn't valid JSON,
   or `max_tokens`/`n` exceed their caps.
 - Returns the chat completion JSON for regular requests, or relays a
   server-sent events stream when `"stream": true` is set.
-
-### `POST /v1/register`
-
-Lets a student set their password for the first time. Meant to be called
-from a browser (e.g. the companion `pgl-registry-front` page) via
-`fetch()`, not from student LangChain/OpenAI SDK code — so it's the only
-endpoint with CORS enabled, restricted to the origins listed in
-`ALLOWED_FRONTEND_ORIGINS`.
-
-Body: `{"matricula": "20231001", "senha": "..."}` (senha 8–72 chars).
-
-- Returns `200 {"status": "ok"}` on success.
-- Returns `404` if the matricula isn't registered/active in
-  `pgl_proxy.students` (see [Student authentication](#student-authentication-neon)
-  below — it must already exist, e.g. from `import_students_csv`).
-- Returns `409` if that matricula already has a password set. There is no
-  self-service reset: matricula alone isn't a secret, so anyone could
-  otherwise hijack another student's account by "resetting" it. Use
-  `python -m scripts.manage_students set-password <matricula>` to reset
-  one as an instructor.
-- Returns `429` if the calling IP has registered too many times recently
-  (`REGISTER_RATE_LIMIT_MAX_REQUESTS` per `REGISTER_RATE_LIMIT_WINDOW_SECONDS`,
-  see [`app/main.py`](app/main.py)) — this also throttles brute-forcing
-  which matriculas exist.
-- Returns `422` if `senha` is missing or outside 8–72 characters.
 
 ### `GET /health`
 
@@ -127,10 +110,11 @@ guardrails before forwarding a request to OpenAI:
   correctly even across multiple serverless instances, unlike an in-memory
   counter would.
 
-## Student authentication (Neon)
+## Student enrollment (Neon)
 
-Only matriculas registered, marked active, and with a password set in Neon
-may use the proxy.
+Only matriculas registered and marked active in `pgl_proxy.students` may
+authenticate (whether getting a token from `pgl_auth_server`, or using this
+proxy with one). This repo owns that table; it does not store credentials.
 
 1. **Create the schema/tables** (once, or whenever
    [`db/schema.sql`](db/schema.sql) changes — it's idempotent and never
@@ -151,7 +135,6 @@ may use the proxy.
    | `sis_id`        | `text`        | from Canvas "ID do SIS"                 |
    | `course`        | `text`        | from Canvas "Seção"                     |
    | `role`          | `text`        | from Canvas "Papel"                     |
-   | `password_hash` | `text`        | bcrypt hash, set via `manage_students set-password` |
    | `is_active`     | `boolean`     | defaults to `true`                     |
    | `last_modified` | `timestamptz` | auto-updated by a trigger on `UPDATE`  |
 
@@ -170,13 +153,8 @@ may use the proxy.
    python -m scripts.manage_students add 20231001 20231002
    python -m scripts.manage_students deactivate 20231001
    python -m scripts.manage_students activate 20231001
-   python -m scripts.manage_students set-password 20231001
    python -m scripts.manage_students list
    ```
-
-   `set-password` prompts (via `getpass`, so it isn't echoed or stored in
-   shell history) for the student's senha and stores its bcrypt hash. A
-   matricula cannot authenticate until a password has been set.
 
    For a full roster export from Canvas ("People" page → export as CSV,
    or transcribed into [`db/roster.csv`](db/roster.csv) with columns
@@ -187,9 +165,16 @@ may use the proxy.
    python -m scripts.import_students_csv db/roster.csv
    ```
 
-3. Students set `"matricula:senha"` as `api_key` when configuring their
-   client, e.g.
-   `ChatOpenAI(base_url="http://your-server:8000/v1", api_key="20231001:their-senha")`.
+3. Once enrolled, students register a password and log in through
+   `pgl_auth_server` (see that repo, or the `pgl_auth` PyPI package), and
+   set the resulting JWT as `api_key`, e.g.:
+
+   ```python
+   from pgl_auth import PGLAuthClient
+   token = PGLAuthClient().login(matricula="20231001", senha="...")
+
+   ChatOpenAI(base_url="http://your-server:8000/v1", api_key=token)
+   ```
 
 ## Running locally
 
@@ -201,6 +186,7 @@ export LANGFUSE_PUBLIC_KEY="pk-lf-..."
 export LANGFUSE_SECRET_KEY="sk-lf-..."
 export LANGFUSE_HOST="https://cloud.langfuse.com"  # or your self-hosted URL
 export NEON_DATABASE_URL="postgresql://..."
+export JWT_SECRET_KEY="..."  # must match pgl_auth_server's JWT_SECRET_KEY
 
 python -m scripts.init_db  # once, to create the schema/table
 uvicorn app.main:app --host 0.0.0.0 --port 8000
@@ -221,11 +207,14 @@ pytest -v
 
 The test suite mocks both the OpenAI client and the Neon lookup entirely
 (see [`tests/conftest.py`](tests/conftest.py)), so no real API key,
-database, or network access is required to run it. It covers:
+database, or network access is required to run it. Test JWTs are minted
+locally with a fixed test `JWT_SECRET_KEY`, matching how `pgl_auth_server`
+signs real ones. It covers:
 
 - The `/health` endpoint.
-- The matricula authentication dependency (`require_active_matricula`):
-  missing/malformed header, inactive/unknown matricula, valid matricula.
+- The JWT authentication dependency (`require_active_matricula`):
+  missing/malformed header, invalid/wrong-secret/expired token,
+  inactive/unknown matricula, valid token.
 - The model allowlist validation (`validate_model`).
 - `/v1/chat/completions` for missing auth, missing/disallowed models,
   successful non-streaming completions, streaming (SSE) completions, and
@@ -250,9 +239,9 @@ before deploying:
 - `LANGFUSE_SECRET_KEY`
 - `LANGFUSE_HOST`
 - `NEON_DATABASE_URL`
-- `ALLOWED_FRONTEND_ORIGINS` — comma-separated origins allowed to call
-  `/v1/register` via CORS, e.g. `https://pgl-registry-front.vercel.app`.
-  Leave unset to keep `/v1/register` unreachable from any browser page.
+- `JWT_SECRET_KEY` — must be the exact same value configured on
+  `pgl_auth_server`, since that's the service that actually signs the
+  tokens this proxy verifies.
 
 > **Streaming caveat:** Vercel serverless functions have an execution time
 > limit (10s on the free plan, longer on paid plans). If streamed OpenAI

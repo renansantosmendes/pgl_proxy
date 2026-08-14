@@ -55,8 +55,10 @@ def test_missing_authorization_returns_401(client):
     assert response.status_code == 401
 
 
-def test_inactive_or_unknown_matricula_returns_403(client, mock_verify_student_credentials):
-    client.headers["Authorization"] = "Bearer 00000000:wrong-senha"
+def test_inactive_or_unknown_matricula_returns_403(client, mock_is_enrollment_active):
+    from conftest import make_token
+
+    client.headers["Authorization"] = f"Bearer {make_token('00000000')}"
 
     response = client.post(
         "/v1/chat/completions", json={"model": "gpt-4o-mini", "messages": []}

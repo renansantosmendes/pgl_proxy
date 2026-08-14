@@ -24,14 +24,23 @@ How it works
 
 Authentication
 --------------
-Students authenticate with `"<matricula>:<senha>"` (enrollment number and
-password), passed as the `api_key` in their OpenAI/LangChain client
-(`ChatOpenAI(api_key="matricula:senha")`). The SDK sends it as
-`Authorization: Bearer <matricula>:<senha>`, which this server checks
-against the `pgl_proxy.students` table in Neon: the matricula must exist,
-be marked active, and `senha` must match its stored bcrypt hash. See
-db/schema.sql and scripts/init_db.py to set up that table, and
-scripts/manage_students.py to register matriculas and set passwords.
+Students authenticate with a short-lived JWT, passed as the `api_key` in
+their OpenAI/LangChain client (`ChatOpenAI(api_key=token)`). The SDK sends
+it as `Authorization: Bearer <token>`. This server never sees a student's
+password: the token is obtained separately, by the student, from
+`pgl_auth_server` (via the `pgl_auth` PyPI package or its `/api/login`
+endpoint directly), which verifies matricula/senha against `pgl_auth.students`
+and signs a JWT (HS256, ``sub`` = matricula, 4h TTL). This server only:
+
+1. Verifies the token's signature and expiry using the same `JWT_SECRET_KEY`
+   (must be configured identically on both services).
+2. Re-checks that the matricula is still active in `pgl_proxy.students` on
+   every request — a token can outlive a mid-window deactivation, so this
+   is the defense-in-depth check against that.
+
+See db/schema.sql and scripts/init_db.py to set up `pgl_proxy.students`, and
+scripts/manage_students.py to manage which matriculas are enrolled/active
+(this repo only owns enrollment status, not credentials).
 
 Running locally
 ----------------
@@ -41,6 +50,7 @@ Running locally
     export LANGFUSE_SECRET_KEY="sk-lf-..."
     export LANGFUSE_HOST="https://cloud.langfuse.com"  # or your self-hosted URL
     export NEON_DATABASE_URL="postgresql://..."
+    export JWT_SECRET_KEY="..."  # must match pgl_auth_server's JWT_SECRET_KEY
     python -m scripts.init_db  # once, to create the schema/table
     uvicorn app.main:app --host 0.0.0.0 --port 8000
 """
@@ -49,10 +59,9 @@ import json
 from contextlib import asynccontextmanager
 from typing import Optional
 
+import jwt
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
-from pydantic import BaseModel, Field
 
 # The Langfuse-wrapped OpenAI client is a drop-in replacement for the
 # official `openai` SDK client: every call made through it is automatically
@@ -60,14 +69,8 @@ from pydantic import BaseModel, Field
 from langfuse import propagate_attributes
 from langfuse.openai import AsyncOpenAI
 
-from app.config import ALLOWED_FRONTEND_ORIGINS, OPENAI_API_KEY
-from app.db import (
-    check_and_increment_keyed_rate_limit,
-    check_and_increment_rate_limit,
-    close_pool,
-    register_password,
-    verify_student_credentials,
-)
+from app.config import JWT_SECRET_KEY, OPENAI_API_KEY
+from app.db import check_and_increment_rate_limit, close_pool, is_enrollment_active
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -122,30 +125,10 @@ MAX_REQUEST_BODY_BYTES = 256 * 1024  # 256 KiB
 RATE_LIMIT_MAX_REQUESTS = 20
 RATE_LIMIT_WINDOW_SECONDS = 60
 
-#: Per-client-IP budget for /v1/register, enforced in Neon. Deliberately
-#: strict and keyed by IP (not matricula) since register attempts happen
-#: before a matricula is known to be valid, which would otherwise let
-#: someone brute-force which matriculas exist.
-REGISTER_RATE_LIMIT_MAX_REQUESTS = 5
-REGISTER_RATE_LIMIT_WINDOW_SECONDS = 300
-
-#: Bounds on the student-chosen password, enforced by RegisterRequest.
-#: bcrypt silently ignores bytes past 72, so the max keeps the stored hash
-#: meaningful over the whole password rather than a truncated prefix.
-MIN_SENHA_LENGTH = 8
-MAX_SENHA_LENGTH = 72
-
 #: Langfuse-instrumented OpenAI client used for every request. Langfuse
 #: picks up its own credentials (LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY,
 #: LANGFUSE_HOST) from environment variables automatically.
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
-
-
-class RegisterRequest(BaseModel):
-    """Body of `POST /v1/register`."""
-
-    matricula: str = Field(min_length=1)
-    senha: str = Field(min_length=MIN_SENHA_LENGTH, max_length=MAX_SENHA_LENGTH)
 
 
 # ---------------------------------------------------------------------------
@@ -184,51 +167,62 @@ def validate_model(model_name: Optional[str]) -> None:
 async def require_active_matricula(
     authorization: Optional[str] = Header(default=None),
 ) -> str:
-    """Resolve and validate the student's matricula/senha from the request.
+    """Resolve and validate the student's matricula from a bearer JWT.
 
-    Students pass ``"<matricula>:<senha>"`` as the `api_key` in their
-    OpenAI/LangChain client, which the SDK sends as an
-    ``Authorization: Bearer <matricula>:<senha>`` header. This looks up
-    the matricula in Neon and confirms it is registered, active, and that
-    `senha` matches its stored password.
+    Students pass the JWT issued by `pgl_auth_server` (after it verifies
+    their matricula/senha) as the `api_key` in their OpenAI/LangChain
+    client, which the SDK sends as an `Authorization: Bearer <token>`
+    header. This verifies the token's signature/expiry, then re-checks
+    that the matricula is still active in Neon.
 
     Parameters
     ----------
     authorization:
         The raw `Authorization` header, expected to be
-        ``"Bearer <matricula>:<senha>"``.
+        ``"Bearer <jwt>"``.
 
     Returns
     -------
     str
-        The validated matricula.
+        The validated matricula (the token's ``sub`` claim).
 
     Raises
     ------
     HTTPException
-        401 if the header is missing/malformed or the credentials are
-        invalid, or 403 if the matricula is not registered or is inactive.
+        401 if the header is missing/malformed or the token is invalid or
+        expired, or 403 if the matricula is not registered or is inactive.
     """
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(
             status_code=401,
-            detail="Missing bearer token: set 'matricula:senha' as the api_key",
+            detail="Missing bearer token: set your pgl_auth access token as the api_key",
         )
 
     token = authorization[len("Bearer "):].strip()
-    matricula, _, senha = token.partition(":")
-    matricula = matricula.strip()
-    senha = senha.strip()
-    if not matricula or not senha:
+    if not token:
         raise HTTPException(
             status_code=401,
-            detail="Malformed bearer token: expected api_key='matricula:senha'",
+            detail="Missing bearer token: set your pgl_auth access token as the api_key",
         )
 
-    if not await verify_student_credentials(matricula, senha):
+    try:
+        claims = jwt.decode(token, JWT_SECRET_KEY, algorithms=["HS256"])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(
+            status_code=401,
+            detail="Token expired: log in again with pgl_auth to get a new one",
+        ) from None
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token") from None
+
+    matricula = claims.get("sub")
+    if not matricula:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    if not await is_enrollment_active(matricula):
         raise HTTPException(
             status_code=403,
-            detail="Invalid matricula/senha, or matricula is inactive",
+            detail="Matricula not recognized or inactive",
         )
 
     return matricula
@@ -320,18 +314,6 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Only /v1/register is meant to be called from a browser (pgl-registry-front).
-# /v1/chat/completions is called from student backends/scripts via the
-# OpenAI SDK, not fetch()/XHR, so it doesn't need (or get) CORS headers.
-# With no origins configured, browsers can't call /v1/register at all.
-if ALLOWED_FRONTEND_ORIGINS:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=ALLOWED_FRONTEND_ORIGINS,
-        allow_methods=["POST"],
-        allow_headers=["Content-Type"],
-    )
-
 
 @app.post("/v1/chat/completions")
 async def chat_completions(
@@ -362,12 +344,12 @@ async def chat_completions(
     Raises
     ------
     HTTPException
-        401 if the matricula/senha (sent as the client's ``api_key``) is
-        missing or malformed, 403 if the credentials are invalid, the
-        matricula is inactive, or the requested model is not in
-        ``ALLOWED_MODELS``, 429 if the matricula's rate limit was
-        exceeded, 413 if the request body is too large, or 400 if the
-        request has no model field or exceeds a cost cap.
+        401 if the bearer token (sent as the client's ``api_key``) is
+        missing, malformed, invalid, or expired, 403 if the matricula is
+        inactive or the requested model is not in ``ALLOWED_MODELS``, 429
+        if the matricula's rate limit was exceeded, 413 if the request
+        body is too large, or 400 if the request has no model field or
+        exceeds a cost cap.
     """
     body = await request.body()
     if len(body) > MAX_REQUEST_BODY_BYTES:
@@ -428,67 +410,6 @@ async def _stream_chat_completion(payload: dict, matricula: str):
         async for chunk in stream:
             yield f"data: {chunk.model_dump_json()}\n\n".encode("utf-8")
     yield b"data: [DONE]\n\n"
-
-
-@app.post("/v1/register")
-async def register(payload: RegisterRequest, request: Request):
-    """Let a student set their password for the first time.
-
-    Intended to be called from the pgl-registry-front web page, not from
-    student LangChain/OpenAI SDK code. Only works once per matricula: if a
-    password is already set, this returns 409 and the student (or an
-    instructor) must use another path to change it, since `matricula`
-    alone isn't a secret and can't prove ownership of an existing account.
-
-    Parameters
-    ----------
-    payload:
-        ``{"matricula": ..., "senha": ...}``.
-    request:
-        Used only to read the client's IP for rate limiting.
-
-    Returns
-    -------
-    dict
-        ``{"status": "ok"}`` on success.
-
-    Raises
-    ------
-    HTTPException
-        429 if this client IP has registered too many times recently, 404
-        if the matricula isn't a registered/active student, or 409 if it
-        already has a password set.
-    """
-    client_ip = request.client.host if request.client else "unknown"
-    allowed = await check_and_increment_keyed_rate_limit(
-        f"register-ip:{client_ip}",
-        REGISTER_RATE_LIMIT_MAX_REQUESTS,
-        REGISTER_RATE_LIMIT_WINDOW_SECONDS,
-    )
-    if not allowed:
-        raise HTTPException(
-            status_code=429,
-            detail=(
-                f"Too many registration attempts: max "
-                f"{REGISTER_RATE_LIMIT_MAX_REQUESTS} per "
-                f"{REGISTER_RATE_LIMIT_WINDOW_SECONDS}s"
-            ),
-        )
-
-    status = await register_password(payload.matricula.strip(), payload.senha)
-
-    if status == "not_found_or_inactive":
-        raise HTTPException(
-            status_code=404,
-            detail="Matrícula não encontrada ou inativa. Fale com o professor.",
-        )
-    if status == "already_registered":
-        raise HTTPException(
-            status_code=409,
-            detail="Essa matrícula já possui uma senha cadastrada.",
-        )
-
-    return {"status": "ok"}
 
 
 @app.get("/health")

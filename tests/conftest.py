@@ -1,8 +1,10 @@
 import os
 import sys
+import time
 from pathlib import Path
 from unittest.mock import AsyncMock
 
+import jwt
 import pytest
 from fastapi.testclient import TestClient
 
@@ -15,15 +17,25 @@ os.environ.setdefault("LANGFUSE_HOST", "https://cloud.langfuse.com")
 os.environ.setdefault(
     "NEON_DATABASE_URL", "postgresql://user:pass@localhost/dummy"
 )
+os.environ.setdefault("JWT_SECRET_KEY", "test-jwt-secret-at-least-32-bytes-long")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app import main as app_main  # noqa: E402
 
-#: A matricula/senha pair used by tests that need a valid, active student
-#: without touching the real Neon database.
+#: A matricula used by tests that need a valid, active student without
+#: touching the real Neon database.
 ACTIVE_MATRICULA = "20230001"
-ACTIVE_SENHA = "correct-senha"
+
+
+def make_token(matricula: str = ACTIVE_MATRICULA, expires_in: int = 3600) -> str:
+    """Sign a test JWT the same way pgl_auth_server would, using the test secret."""
+    now = int(time.time())
+    return jwt.encode(
+        {"sub": matricula, "iat": now, "exp": now + expires_in},
+        os.environ["JWT_SECRET_KEY"],
+        algorithm="HS256",
+    )
 
 
 @pytest.fixture
@@ -32,18 +44,15 @@ def client():
 
 
 @pytest.fixture
-def mock_verify_student_credentials(monkeypatch):
-    """Replace the Neon credential check with an AsyncMock.
+def mock_is_enrollment_active(monkeypatch):
+    """Replace the Neon lookup with an AsyncMock.
 
-    Defaults to treating `ACTIVE_MATRICULA`/`ACTIVE_SENHA` as valid and
-    everything else as invalid/inactive, mirroring what a real lookup
-    would do. Tests can override `mock.side_effect` for other scenarios.
+    Defaults to treating `ACTIVE_MATRICULA` as active and everything else
+    as inactive/unknown, mirroring what a real lookup would do. Tests can
+    override `mock.side_effect` for other scenarios.
     """
-    mock = AsyncMock(
-        side_effect=lambda matricula, senha: matricula == ACTIVE_MATRICULA
-        and senha == ACTIVE_SENHA
-    )
-    monkeypatch.setattr(app_main, "verify_student_credentials", mock)
+    mock = AsyncMock(side_effect=lambda matricula: matricula == ACTIVE_MATRICULA)
+    monkeypatch.setattr(app_main, "is_enrollment_active", mock)
     return mock
 
 
@@ -60,30 +69,10 @@ def mock_check_rate_limit(monkeypatch):
 
 
 @pytest.fixture
-def authenticated_client(client, mock_verify_student_credentials, mock_check_rate_limit):
-    """A TestClient that already sends a valid matricula:senha as the api_key."""
-    client.headers["Authorization"] = f"Bearer {ACTIVE_MATRICULA}:{ACTIVE_SENHA}"
+def authenticated_client(client, mock_is_enrollment_active, mock_check_rate_limit):
+    """A TestClient that already sends a valid JWT as the api_key."""
+    client.headers["Authorization"] = f"Bearer {make_token()}"
     return client
-
-
-@pytest.fixture
-def mock_register_password(monkeypatch):
-    """Replace the Neon register-password call with an AsyncMock.
-
-    Defaults to returning "ok". Tests override `mock.return_value` for
-    "not_found_or_inactive" / "already_registered" scenarios.
-    """
-    mock = AsyncMock(return_value="ok")
-    monkeypatch.setattr(app_main, "register_password", mock)
-    return mock
-
-
-@pytest.fixture
-def mock_check_keyed_rate_limit(monkeypatch):
-    """Replace the Neon keyed rate limiter with an AsyncMock that always allows."""
-    mock = AsyncMock(return_value=True)
-    monkeypatch.setattr(app_main, "check_and_increment_keyed_rate_limit", mock)
-    return mock
 
 
 @pytest.fixture

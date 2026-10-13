@@ -40,6 +40,7 @@ but not *credentials* — passwords and token issuance live in the separate
 ```
 app/
   main.py             FastAPI application (the proxy itself)
+  anthropic_messages.py  Allowlist, cost caps, error mapping and SSE helpers for /v1/messages
   db.py                Neon connection pool + registration-number/rate-limit lookups
   config.py            Environment-derived configuration
 db/
@@ -53,6 +54,11 @@ tests/
   test_auth.py         Tests for the JWT authentication dependency
   test_validate_model.py    Tests for the model allowlist logic
   test_chat_completions.py  Tests for POST /v1/chat/completions
+  test_messages.py          Tests for POST /v1/messages (incl. the real anthropic SDK end to end)
+  test_anthropic_messages.py  Tests for the /v1/messages helpers
+examples/
+  chatopenai_example.py     LangChain ChatOpenAI through the proxy
+  chatanthropic_example.py  LangChain ChatAnthropic through the proxy
 .github/workflows/
   ci.yml              GitHub Actions pipeline (runs the test suite)
 vercel.json           Vercel deployment configuration
@@ -79,6 +85,52 @@ the same JSON body as OpenAI (`model`, `messages`, `stream`, etc.).
 - Returns the chat completion JSON for regular requests, or relays a
   server-sent events stream when `"stream": true` is set.
 
+### `POST /v1/messages`
+
+Mirrors Anthropic's `POST /v1/messages` (Messages API) so LangChain's
+`ChatAnthropic` (or the raw `anthropic` SDK) works by setting `base_url` to
+the proxy root (no `/v1` suffix — the SDK appends `/v1/messages` itself)
+and `api_key` to the student's JWT. Those clients send the key in the
+`x-api-key` header; the proxy accepts it there or as
+`Authorization: Bearer <token>`. The body is forwarded unchanged after the
+guardrails below, and the response (or SSE stream) comes back in
+Anthropic's own format.
+
+- Only models in `ALLOWED_ANTHROPIC_MODELS` (`claude-haiku-4-5`) are
+  accepted (`403` otherwise).
+- Only known Messages API fields are forwarded (`model`, `messages`,
+  `system`, `max_tokens`, `stop_sequences`, `stream`, `temperature`,
+  `top_p`, `top_k`, `tools`, `tool_choice`, `thinking`, `output_config`);
+  anything else (`metadata`, `service_tier`, `mcp_servers`, ...) is dropped.
+- `max_tokens` above `MAX_TOKENS_LIMIT` (2048) is **lowered** to the limit
+  (and a missing one is set to it) instead of rejected: `ChatAnthropic`
+  sends the model's maximum output (64000) unless the student sets it.
+  Non-positive or non-integer values return `400`.
+- Only custom (client-side) tools are allowed; Anthropic server tools
+  (web search, code execution, ...) are billed per use and return `400`.
+- Shares the per-registration-number rate limit with
+  `/v1/chat/completions`.
+- Upstream errors caused by the request (`400`, `404`, `413`, `422`,
+  `429`) are relayed with Anthropic's body, so the SDK raises the matching
+  typed error; upstream credential or availability problems become `502`.
+- Returns `503` when `ANTHROPIC_API_KEY` is not configured.
+- Every call is recorded in Langfuse as a generation (input, output, token
+  usage, time to first token) tagged with the registration number as
+  `user_id`.
+
+```python
+from langchain_anthropic import ChatAnthropic
+from pgl_auth import PGLAuthClient
+
+token = PGLAuthClient().login("<registration_number>", "<password>")
+llm = ChatAnthropic(
+    model="claude-haiku-4-5",
+    base_url="https://<proxy-host>",  # no /v1 here
+    api_key=token,
+    max_tokens=1024,
+)
+```
+
 ### `GET /health`
 
 Simple liveness check. Returns `{"status": "ok"}`.
@@ -86,7 +138,10 @@ Simple liveness check. Returns `{"status": "ok"}`.
 ## Allowed models
 
 The set of models students may request is defined in `ALLOWED_MODELS` in
-[`app/main.py`](app/main.py). Requests for any other model are rejected
+[`app/main.py`](app/main.py) for `/v1/chat/completions` (OpenAI) and in
+`ALLOWED_ANTHROPIC_MODELS` in
+[`app/anthropic_messages.py`](app/anthropic_messages.py) for `/v1/messages`
+(Anthropic, currently only `claude-haiku-4-5`). Requests for any other model are rejected
 before they reach OpenAI, keeping costs predictable.
 
 ## Abuse protection
@@ -182,6 +237,7 @@ proxy with one). This repo owns that table; it does not store credentials.
 pip install -r requirements.txt
 
 export OPENAI_API_KEY="sk-..."
+export ANTHROPIC_API_KEY="sk-ant-..."  # optional; enables /v1/messages
 export LANGFUSE_PUBLIC_KEY="pk-lf-..."
 export LANGFUSE_SECRET_KEY="sk-lf-..."
 export LANGFUSE_HOST="https://cloud.langfuse.com"  # or your self-hosted URL
@@ -205,7 +261,7 @@ pip install -r requirements-dev.txt
 pytest -v
 ```
 
-The test suite mocks both the OpenAI client and the Neon lookup entirely
+The test suite mocks the OpenAI and Anthropic clients and the Neon lookup entirely
 (see [`tests/conftest.py`](tests/conftest.py)), so no real API key,
 database, or network access is required to run it. Test JWTs are minted
 locally with a fixed test `JWT_SECRET_KEY`, matching how `pgl_auth_server`
@@ -219,6 +275,10 @@ signs real ones. It covers:
 - `/v1/chat/completions` for missing auth, missing/disallowed models,
   successful non-streaming completions, streaming (SSE) completions, and
   upstream error propagation.
+- `/v1/messages`: `x-api-key`/bearer authentication, the Anthropic model
+  allowlist, field allowlist, `max_tokens` capping, server-tool rejection,
+  non-streaming and SSE relay, upstream error mapping, Langfuse recording,
+  and an end-to-end run of the real `anthropic` SDK against the proxy app.
 
 ## Continuous integration
 
@@ -235,6 +295,7 @@ Set the following environment variables in the Vercel project settings
 before deploying:
 
 - `OPENAI_API_KEY`
+- `ANTHROPIC_API_KEY` — optional; without it `/v1/messages` answers `503`
 - `LANGFUSE_PUBLIC_KEY`
 - `LANGFUSE_SECRET_KEY`
 - `LANGFUSE_HOST`

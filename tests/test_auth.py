@@ -58,3 +58,37 @@ async def test_active_registration_number_is_returned(mock_is_enrollment_active)
     result = await require_active_registration_number(authorization=f"Bearer {make_token()}")
 
     assert result == ACTIVE_REGISTRATION_NUMBER
+
+
+async def test_x_api_key_header_is_accepted(mock_is_enrollment_active):
+    from app.main import require_active_registration_number_from_api_key
+    from conftest import ACTIVE_REGISTRATION_NUMBER, make_token
+
+    result = await require_active_registration_number_from_api_key(
+        authorization=None, x_api_key=make_token()
+    )
+
+    assert result == ACTIVE_REGISTRATION_NUMBER
+
+
+async def test_x_api_key_falls_back_to_bearer(mock_is_enrollment_active):
+    from app.main import require_active_registration_number_from_api_key
+    from conftest import ACTIVE_REGISTRATION_NUMBER, make_token
+
+    result = await require_active_registration_number_from_api_key(
+        authorization=f"Bearer {make_token()}", x_api_key=None
+    )
+
+    assert result == ACTIVE_REGISTRATION_NUMBER
+
+
+@pytest.mark.parametrize("x_api_key", ["not-a-real-jwt", None, "   "])
+async def test_invalid_or_missing_x_api_key_raises_401(x_api_key):
+    from app.main import require_active_registration_number_from_api_key
+
+    with pytest.raises(HTTPException) as exc_info:
+        await require_active_registration_number_from_api_key(
+            authorization=None, x_api_key=x_api_key
+        )
+
+    assert exc_info.value.status_code == 401

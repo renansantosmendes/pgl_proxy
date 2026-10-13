@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 # Environment variables must exist before `app.main` is imported, since the
 # module reads OPENAI_API_KEY at import time (os.environ["OPENAI_API_KEY"]).
 os.environ.setdefault("OPENAI_API_KEY", "sk-test-dummy-key")
+os.environ.setdefault("ANTHROPIC_API_KEY", "sk-ant-test-dummy-key")
 os.environ.setdefault("LANGFUSE_PUBLIC_KEY", "pk-lf-test")
 os.environ.setdefault("LANGFUSE_SECRET_KEY", "sk-lf-test")
 os.environ.setdefault("LANGFUSE_HOST", "https://cloud.langfuse.com")
@@ -88,3 +89,64 @@ def mock_openai_create(monkeypatch):
     mock = AsyncMock()
     monkeypatch.setattr(app_main.openai_client.chat.completions, "create", mock)
     return mock
+
+
+@pytest.fixture
+def mock_anthropic_create(monkeypatch):
+    """Replace the Anthropic messages call with an AsyncMock.
+
+    Tests configure `mock.return_value` or `mock.side_effect` to control
+    what the "Anthropic API" hands back, without ever making a real call.
+    """
+    mock = AsyncMock()
+    monkeypatch.setattr(app_main.anthropic_client.messages, "create", mock)
+    return mock
+
+
+class FakeGeneration:
+    """Records what the proxy reports to a Langfuse generation."""
+
+    def __init__(self, **start_kwargs):
+        self.start_kwargs = start_kwargs
+        self.updates = []
+        self.ended = False
+
+    def update(self, **kwargs):
+        self.updates.append(kwargs)
+        return self
+
+    def end(self):
+        self.ended = True
+
+    def merged_updates(self) -> dict:
+        merged = {}
+        for update in self.updates:
+            merged.update(update)
+        return merged
+
+
+class FakeLangfuse:
+    """Stand-in for the Langfuse client returned by `get_client()`."""
+
+    def __init__(self):
+        self.generations = []
+
+    def start_observation(self, **kwargs):
+        generation = FakeGeneration(**kwargs)
+        self.generations.append(generation)
+        return generation
+
+
+@pytest.fixture
+def fake_langfuse(monkeypatch):
+    """Capture the Langfuse generations recorded by `/v1/messages`."""
+    langfuse = FakeLangfuse()
+    monkeypatch.setattr(app_main, "get_client", lambda: langfuse)
+    return langfuse
+
+
+@pytest.fixture
+def anthropic_client(client, mock_is_enrollment_active, mock_check_rate_limit, fake_langfuse):
+    """A TestClient that sends a valid JWT the way `ChatAnthropic` does."""
+    client.headers["x-api-key"] = make_token()
+    return client

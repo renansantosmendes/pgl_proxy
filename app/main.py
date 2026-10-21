@@ -90,6 +90,20 @@ ALLOWED_MODELS: set[str] = {
     "gpt-5.4-mini",
 }
 
+#: Embedding models students may request. text-embedding-3-small is the
+#: cheapest current OpenAI embedding model, so per-class costs stay predictable.
+ALLOWED_EMBEDDING_MODELS: set[str] = {
+    "text-embedding-3-small",
+}
+
+#: The only embeddings request fields the proxy will forward.
+ALLOWED_EMBEDDING_FIELDS: set[str] = {
+    "model",
+    "input",
+    "encoding_format",
+    "dimensions",
+}
+
 #: The only OpenAI chat completion fields the proxy will forward. Anything
 #: else in the student's request body is dropped, which both keeps unknown
 #: fields from reaching the OpenAI SDK call and prevents a student payload
@@ -120,6 +134,15 @@ MAX_TOKENS_LIMIT = 2048
 #: Upper bound on how many completions a single request may ask for.
 MAX_N = 1
 
+#: Largest number of texts in one embeddings request.
+MAX_EMBEDDING_INPUTS = 100
+
+#: Largest total number of characters across the texts of one embeddings request.
+MAX_EMBEDDING_CHARS = 50_000
+
+#: Largest vector size a student may ask for.
+MAX_EMBEDDING_DIMENSIONS = 1536
+
 #: Requests larger than this are rejected before being parsed as JSON.
 MAX_REQUEST_BODY_BYTES = 256 * 1024  # 256 KiB
 
@@ -138,30 +161,38 @@ openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 # ---------------------------------------------------------------------------
 
 
-def validate_model(model_name: Optional[str]) -> None:
+def validate_model(
+    model_name: Optional[str], allowed_models: Optional[set[str]] = None
+) -> None:
     """Ensure the requested model is on the class's allowlist.
 
     Parameters
     ----------
     model_name:
-        The value of the ``"model"`` field from the student's request body,
-        or ``None`` if the field was omitted entirely.
+        The value of the "model" field from the student's request body,
+        or "None" if the field was omitted entirely.
+    allowed_models:
+        The allowlist of the endpoint being called. Defaults to
+        "ALLOWED_MODELS" (the chat completions models).
 
     Raises
     ------
     HTTPException
-        400 if ``model_name`` is missing, or 403 if it is not present in
-        ``ALLOWED_MODELS``.
+        400 if "model_name" is missing, or 403 if it is not present in
+        "allowed_models".
     """
+    if allowed_models is None:
+        allowed_models = ALLOWED_MODELS
+
     if not model_name:
         raise HTTPException(status_code=400, detail="Field 'model' is required")
 
-    if model_name not in ALLOWED_MODELS:
+    if model_name not in allowed_models:
         raise HTTPException(
             status_code=403,
             detail=(
                 f"Model '{model_name}' is not allowed. "
-                f"Allowed models: {sorted(ALLOWED_MODELS)}"
+                f"Allowed models: {sorted(allowed_models)}"
             ),
         )
 
@@ -320,6 +351,101 @@ app = FastAPI(
 )
 
 
+async def _read_json_body(request: Request) -> dict:
+    """Read the request body, enforcing the size limit, and parse it as JSON.
+
+    Parameters
+    ----------
+    request:
+        The incoming FastAPI request.
+
+    Returns
+    -------
+    dict
+        The parsed JSON object.
+
+    Raises
+    ------
+    HTTPException
+        413 if the body exceeds `MAX_REQUEST_BODY_BYTES`, or 400 if it is
+        not a valid JSON object.
+    """
+    body = await request.body()
+    if len(body) > MAX_REQUEST_BODY_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Request body exceeds {MAX_REQUEST_BODY_BYTES} bytes",
+        )
+
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        raise HTTPException(
+            status_code=400, detail="Request body is not valid JSON"
+        ) from None
+
+    if not isinstance(payload, dict):
+        raise HTTPException(
+            status_code=400, detail="Request body must be a JSON object"
+        )
+    return payload
+
+
+def sanitize_embedding_payload(payload: dict) -> dict:
+    """Drop unknown fields and enforce the limits of an embeddings request.
+
+    Parameters
+    ----------
+    payload:
+        The student's parsed JSON request body.
+
+    Returns
+    -------
+    dict
+        Only the keys in `ALLOWED_EMBEDDING_FIELDS`, ready to forward to the
+        OpenAI SDK.
+
+    Raises
+    ------
+    HTTPException
+        400 if `input` is not a text or a list of texts, if it has more than
+        `MAX_EMBEDDING_INPUTS` items or more than `MAX_EMBEDDING_CHARS`
+        characters, or if `dimensions` is outside 1..`MAX_EMBEDDING_DIMENSIONS`.
+    """
+    sanitized = {k: v for k, v in payload.items() if k in ALLOWED_EMBEDDING_FIELDS}
+
+    texts = sanitized.get("input")
+    if isinstance(texts, str):
+        texts = [texts]
+    if not isinstance(texts, list) or not texts or not all(isinstance(t, str) for t in texts):
+        raise HTTPException(
+            status_code=400,
+            detail="Field 'input' must be a text or a non-empty list of texts",
+        )
+    if len(texts) > MAX_EMBEDDING_INPUTS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"'input' must have at most {MAX_EMBEDDING_INPUTS} texts",
+        )
+    if sum(len(t) for t in texts) > MAX_EMBEDDING_CHARS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"'input' must have at most {MAX_EMBEDDING_CHARS} characters in total",
+        )
+
+    dimensions = sanitized.get("dimensions")
+    if dimensions is not None and (
+        not isinstance(dimensions, int)
+        or not 1 <= dimensions <= MAX_EMBEDDING_DIMENSIONS
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=f"'dimensions' must be an integer between 1 and {MAX_EMBEDDING_DIMENSIONS}",
+        )
+
+    return sanitized
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(
     request: Request,
@@ -356,19 +482,7 @@ async def chat_completions(
         was exceeded, 413 if the request body is too large, or 400 if the
         request has no model field or exceeds a cost cap.
     """
-    body = await request.body()
-    if len(body) > MAX_REQUEST_BODY_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail=f"Request body exceeds {MAX_REQUEST_BODY_BYTES} bytes",
-        )
-
-    try:
-        payload = sanitize_payload(json.loads(body))
-    except json.JSONDecodeError:
-        raise HTTPException(
-            status_code=400, detail="Request body is not valid JSON"
-        ) from None
+    payload = sanitize_payload(await _read_json_body(request))
 
     validate_model(payload.get("model"))
 
@@ -386,6 +500,49 @@ async def chat_completions(
             metadata={"registration_number": registration_number},
         )
     return JSONResponse(content=completion.model_dump())
+
+
+@app.post("/v1/embeddings")
+async def embeddings(
+    request: Request,
+    registration_number: str = Depends(enforce_rate_limit),
+):
+    """Forward an embeddings request to OpenAI on behalf of a student.
+
+    This endpoint mirrors OpenAI's ``POST /v1/embeddings``, so the OpenAI SDK
+    or LangChain's ``OpenAIEmbeddings`` can call it by changing only
+    ``base_url``. Only the models in `ALLOWED_EMBEDDING_MODELS` are accepted,
+    and every call is traced in Langfuse by the underlying client.
+
+    Parameters
+    ----------
+    request:
+        The incoming FastAPI request. Its JSON body is expected to match the
+        OpenAI embeddings request schema (model, input, dimensions...).
+
+    Returns
+    -------
+    dict
+        The embeddings response, as OpenAI returns it.
+
+    Raises
+    ------
+    HTTPException
+        401 if the bearer token is missing or invalid, 403 if the registration
+        number is inactive or the model is not in `ALLOWED_EMBEDDING_MODELS`,
+        429 if the rate limit was exceeded, 413 if the body is too large, or
+        400 if the input breaks one of the limits.
+    """
+    payload = sanitize_embedding_payload(await _read_json_body(request))
+
+    validate_model(payload.get("model"), ALLOWED_EMBEDDING_MODELS)
+
+    with propagate_attributes(user_id=registration_number):
+        result = await openai_client.embeddings.create(
+            **payload,
+            metadata={"registration_number": registration_number},
+        )
+    return JSONResponse(content=result.model_dump())
 
 
 async def _stream_chat_completion(payload: dict, registration_number: str):

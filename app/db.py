@@ -54,14 +54,27 @@ async def is_enrollment_active(registration_number: str) -> bool:
     return row is not None and row["is_active"]
 
 
+#: Tables of fixed-window counters, one per kind of quota. Each row is keyed by
+#: the student's registration number, so the quotas are kept apart.
+RATE_LIMIT_TABLES: dict[str, str] = {
+    "chat": "rate_limits",
+    "embeddings": "embedding_rate_limits",
+}
+
+
 async def check_and_increment_rate_limit(
-    registration_number: str, max_requests: int, window_seconds: int
+    registration_number: str,
+    max_requests: int,
+    window_seconds: int,
+    kind: str = "chat",
 ) -> bool:
     """Atomically check and consume one request of `registration_number`'s quota.
 
-    Implements a fixed-window counter in `pgl_proxy.rate_limits`: the row
-    is locked with `FOR UPDATE` before it's read and written, so concurrent
-    requests from the same registration number can't race past the limit.
+    Implements a fixed-window counter in the table of the quota `kind`
+    (`pgl_proxy.rate_limits` for chat, `pgl_proxy.embedding_rate_limits` for
+    embeddings): the row is locked with `FOR UPDATE` before it's read and
+    written, so concurrent requests from the same registration number can't
+    race past the limit.
 
     Parameters
     ----------
@@ -71,6 +84,8 @@ async def check_and_increment_rate_limit(
         How many requests `registration_number` may make within `window_seconds`.
     window_seconds:
         Length of the fixed window, in seconds.
+    kind:
+        Which quota is consumed: a key of `RATE_LIMIT_TABLES`.
 
     Returns
     -------
@@ -79,16 +94,25 @@ async def check_and_increment_rate_limit(
         False if `registration_number` has already used up its quota for
         the current window (the request should be rejected, and is not
         counted again).
+
+    Raises
+    ------
+    ValueError
+        If `kind` is not a key of `RATE_LIMIT_TABLES`.
     """
+    if kind not in RATE_LIMIT_TABLES:
+        raise ValueError(f"Unknown rate limit kind: {kind!r}")
+    table = f"pgl_proxy.{RATE_LIMIT_TABLES[kind]}"
+
     pool = await get_pool()
     window = datetime.timedelta(seconds=window_seconds)
 
     async with pool.acquire() as conn:
         async with conn.transaction():
             row = await conn.fetchrow(
-                """
+                f"""
                 SELECT window_start, request_count
-                FROM pgl_proxy.rate_limits
+                FROM {table}
                 WHERE registration_number = $1
                 FOR UPDATE
                 """,
@@ -99,8 +123,8 @@ async def check_and_increment_rate_limit(
 
             if row is None:
                 await conn.execute(
-                    """
-                    INSERT INTO pgl_proxy.rate_limits (registration_number, window_start, request_count)
+                    f"""
+                    INSERT INTO {table} (registration_number, window_start, request_count)
                     VALUES ($1, $2, 1)
                     """,
                     registration_number,
@@ -112,8 +136,8 @@ async def check_and_increment_rate_limit(
 
             if window_expired:
                 await conn.execute(
-                    """
-                    UPDATE pgl_proxy.rate_limits
+                    f"""
+                    UPDATE {table}
                     SET window_start = $2, request_count = 1
                     WHERE registration_number = $1
                     """,
@@ -126,8 +150,8 @@ async def check_and_increment_rate_limit(
                 return False
 
             await conn.execute(
-                """
-                UPDATE pgl_proxy.rate_limits
+                f"""
+                UPDATE {table}
                 SET request_count = request_count + 1
                 WHERE registration_number = $1
                 """,

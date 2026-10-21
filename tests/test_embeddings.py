@@ -102,8 +102,8 @@ def test_missing_model_returns_400(authenticated_client, mock_openai_embeddings)
         {"model": "text-embedding-3-small", "input": []},
         {"model": "text-embedding-3-small", "input": [1, 2, 3]},
         {"model": "text-embedding-3-small", "input": 42},
-        {"model": "text-embedding-3-small", "input": ["x"] * 101},
-        {"model": "text-embedding-3-small", "input": "a" * 50_001},
+        {"model": "text-embedding-3-small", "input": ["x"] * 2049},
+        {"model": "text-embedding-3-small", "input": "a" * 300_001},
         {"model": "text-embedding-3-small", "input": "oi", "dimensions": 0},
         {"model": "text-embedding-3-small", "input": "oi", "dimensions": 5000},
     ],
@@ -115,3 +115,62 @@ def test_inputs_outside_the_limits_return_400(
 
     assert response.status_code == 400
     mock_openai_embeddings.assert_not_awaited()
+
+
+def test_a_long_document_within_the_limits_is_forwarded(
+    authenticated_client, mock_openai_embeddings
+):
+    text = "ação " * 40_000
+
+    response = authenticated_client.post(
+        "/v1/embeddings", json={"model": "text-embedding-3-small", "input": [text]}
+    )
+
+    assert response.status_code == 200
+    mock_openai_embeddings.assert_awaited_once()
+
+
+def test_embeddings_use_their_own_rate_limit(
+    authenticated_client, mock_openai_embeddings, mock_check_rate_limit
+):
+    authenticated_client.post(
+        "/v1/embeddings", json={"model": "text-embedding-3-small", "input": "oi"}
+    )
+
+    mock_check_rate_limit.assert_awaited_once_with(
+        ACTIVE_REGISTRATION_NUMBER,
+        app_main.EMBEDDING_RATE_LIMIT_MAX_REQUESTS,
+        app_main.EMBEDDING_RATE_LIMIT_WINDOW_SECONDS,
+        kind="embeddings",
+    )
+
+
+def test_exhausted_embeddings_quota_returns_429_without_calling_openai(
+    authenticated_client, mock_openai_embeddings, mock_check_rate_limit
+):
+    mock_check_rate_limit.return_value = False
+
+    response = authenticated_client.post(
+        "/v1/embeddings", json={"model": "text-embedding-3-small", "input": "oi"}
+    )
+
+    assert response.status_code == 429
+    mock_openai_embeddings.assert_not_awaited()
+
+
+def test_chat_keeps_the_chat_rate_limit(
+    authenticated_client, mock_check_rate_limit, mock_openai_create
+):
+    from conftest import ACTIVE_REGISTRATION_NUMBER as REG
+
+    mock_openai_create.return_value = SimpleNamespace(
+        model_dump=lambda: {"id": "x", "object": "chat.completion", "choices": []}
+    )
+    authenticated_client.post(
+        "/v1/chat/completions",
+        json={"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "oi"}]},
+    )
+
+    mock_check_rate_limit.assert_awaited_once_with(
+        REG, app_main.RATE_LIMIT_MAX_REQUESTS, app_main.RATE_LIMIT_WINDOW_SECONDS
+    )

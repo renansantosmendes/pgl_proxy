@@ -134,14 +134,19 @@ MAX_TOKENS_LIMIT = 2048
 #: Upper bound on how many completions a single request may ask for.
 MAX_N = 1
 
-#: Largest number of texts in one embeddings request.
-MAX_EMBEDDING_INPUTS = 100
+#: Largest number of texts in one embeddings request (the OpenAI limit).
+MAX_EMBEDDING_INPUTS = 2048
 
-#: Largest total number of characters across the texts of one embeddings request.
-MAX_EMBEDDING_CHARS = 50_000
+#: Largest total number of characters in one embeddings request (about
+#: 75,000 tokens, well under the OpenAI limit of 300,000 tokens per request).
+MAX_EMBEDDING_CHARS = 300_000
 
 #: Largest vector size a student may ask for.
 MAX_EMBEDDING_DIMENSIONS = 1536
+
+#: Largest request body of an embeddings request; it must hold MAX_EMBEDDING_CHARS
+#: of accented text plus JSON escapes.
+MAX_EMBEDDING_BODY_BYTES = 2 * 1024 * 1024
 
 #: Requests larger than this are rejected before being parsed as JSON.
 MAX_REQUEST_BODY_BYTES = 256 * 1024  # 256 KiB
@@ -149,6 +154,11 @@ MAX_REQUEST_BODY_BYTES = 256 * 1024  # 256 KiB
 #: Per-registration_number request budget enforced in Neon (see app/db.py).
 RATE_LIMIT_MAX_REQUESTS = 20
 RATE_LIMIT_WINDOW_SECONDS = 60
+
+#: Embeddings have their own quota: a student indexing documents sends many
+#: texts per request, so the chat limit would block them too early.
+EMBEDDING_RATE_LIMIT_MAX_REQUESTS = 300
+EMBEDDING_RATE_LIMIT_WINDOW_SECONDS = 60
 
 #: Langfuse-instrumented OpenAI client used for every request. Langfuse
 #: picks up its own credentials (LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY,
@@ -263,6 +273,37 @@ async def require_active_registration_number(
     return registration_number
 
 
+async def enforce_embedding_rate_limit(
+    registration_number: str = Depends(require_active_registration_number),
+) -> str:
+    """Consume one unit of `registration_number`'s embeddings budget, or reject.
+
+    Uses its own quota (`EMBEDDING_RATE_LIMIT_MAX_REQUESTS` per
+    `EMBEDDING_RATE_LIMIT_WINDOW_SECONDS`), separate from the chat quota.
+
+    Raises
+    ------
+    HTTPException
+        429 if `registration_number` has used its embeddings quota for the
+        current window.
+    """
+    allowed = await check_and_increment_rate_limit(
+        registration_number,
+        EMBEDDING_RATE_LIMIT_MAX_REQUESTS,
+        EMBEDDING_RATE_LIMIT_WINDOW_SECONDS,
+        kind="embeddings",
+    )
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                f"Rate limit exceeded: max {EMBEDDING_RATE_LIMIT_MAX_REQUESTS} "
+                f"embedding requests per {EMBEDDING_RATE_LIMIT_WINDOW_SECONDS}s"
+            ),
+        )
+    return registration_number
+
+
 async def enforce_rate_limit(
     registration_number: str = Depends(require_active_registration_number),
 ) -> str:
@@ -351,7 +392,9 @@ app = FastAPI(
 )
 
 
-async def _read_json_body(request: Request) -> dict:
+async def _read_json_body(
+    request: Request, max_bytes: int = MAX_REQUEST_BODY_BYTES
+) -> dict:
     """Read the request body, enforcing the size limit, and parse it as JSON.
 
     Parameters
@@ -371,10 +414,10 @@ async def _read_json_body(request: Request) -> dict:
         not a valid JSON object.
     """
     body = await request.body()
-    if len(body) > MAX_REQUEST_BODY_BYTES:
+    if len(body) > max_bytes:
         raise HTTPException(
             status_code=413,
-            detail=f"Request body exceeds {MAX_REQUEST_BODY_BYTES} bytes",
+            detail=f"Request body exceeds {max_bytes} bytes",
         )
 
     try:
@@ -505,7 +548,7 @@ async def chat_completions(
 @app.post("/v1/embeddings")
 async def embeddings(
     request: Request,
-    registration_number: str = Depends(enforce_rate_limit),
+    registration_number: str = Depends(enforce_embedding_rate_limit),
 ):
     """Forward an embeddings request to OpenAI on behalf of a student.
 
@@ -533,7 +576,9 @@ async def embeddings(
         429 if the rate limit was exceeded, 413 if the body is too large, or
         400 if the input breaks one of the limits.
     """
-    payload = sanitize_embedding_payload(await _read_json_body(request))
+    payload = sanitize_embedding_payload(
+        await _read_json_body(request, MAX_EMBEDDING_BODY_BYTES)
+    )
 
     validate_model(payload.get("model"), ALLOWED_EMBEDDING_MODELS)
 
